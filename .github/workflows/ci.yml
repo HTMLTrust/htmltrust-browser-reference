@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build Extensions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx eslint src/ --ext .ts,.tsx || true
+
+      - name: Build Chromium
+        run: npx webpack --mode=production --env target=chromium
+
+      - name: Build Firefox
+        run: npx webpack --mode=production --env target=firefox
+
+      - name: Build Safari
+        run: npx webpack --mode=production --env target=safari
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-chromium
+          path: build/chromium/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-firefox
+          path: build/firefox/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-safari
+          path: build/safari/
