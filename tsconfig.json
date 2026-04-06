@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "sourceMap": true,
+    "outDir": "./build",
+    "rootDir": "./src",
+    "declaration": true,
+    "jsx": "react",
+    "lib": ["DOM", "ES2020"],
+    "typeRoots": ["./node_modules/@types", "./src/types"],
+    "baseUrl": ".",
+    "paths": {
+      "@core/*": ["src/core/*"],
+      "@ui/*": ["src/ui/*"],
+      "@background/*": ["src/background/*"],
+      "@content-scripts/*": ["src/content-scripts/*"],
+      "@platforms/*": ["src/platforms/*"],
+      "@assets/*": ["src/assets/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "build", "**/*.test.ts", "**/*.spec.ts"]
+}
