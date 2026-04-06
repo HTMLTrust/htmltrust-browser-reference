@@ -2,6 +2,7 @@
  * Content processing utilities for DOM normalization and hashing
  */
 import { hashContent } from '../common/utils';
+import { normalizeText } from '@htmltrust/canonicalization';
 import * as simhash from 'simhash-js';
 
 /**
@@ -200,8 +201,8 @@ export class ContentProcessor {
     // Remove comments
     this.removeComments(contentClone);
     
-    // Normalize whitespace
-    const content = this.normalizeWhitespace(contentClone.textContent || '');
+    // Canonicalize text content
+    const content = normalizeText(contentClone.textContent || '');
     
     // Extract metadata if requested
     let metadata: Record<string, string> | undefined;
@@ -430,13 +431,4 @@ export class ContentProcessor {
     }
   }
 
-  /**
-   * Normalize whitespace in a string
-   * @param text The text to normalize
-   * @returns The normalized text
-   */
-  private normalizeWhitespace(text: string): string {
-    // Replace all whitespace sequences with a single space
-    return text.replace(/\s+/g, ' ').trim();
-  }
 }
