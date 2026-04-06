@@ -17,6 +17,11 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Configure private dep access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
+
       - name: Install dependencies
         run: npm ci
 
