@@ -1,0 +1,127 @@
+/**
+ * Styles for the metadata input component
+ */
+
+.metadata-input {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background-color: #f9f9f9;
+}
+
+.metadata-input h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.2rem;
+  color: #333;
+}
+
+.metadata-tabs {
+  display: flex;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.metadata-tabs button {
+  padding: 0.5rem 1rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: #666;
+}
+
+.metadata-tabs button:hover {
+  color: #333;
+}
+
+.metadata-tabs button.active {
+  color: #0066cc;
+  border-bottom-color: #0066cc;
+  font-weight: bold;
+}
+
+.metadata-description {
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: #666;
+}
+
+.metadata-fields {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.metadata-field {
+  margin-bottom: 0.75rem;
+}
+
+.metadata-field label {
+  display: block;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+  color: #333;
+}
+
+.metadata-field input {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  font-size: 0.9rem;
+}
+
+.metadata-field input:focus {
+  border-color: #0066cc;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.2);
+}
+
+.metadata-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 1rem;
+  gap: 0.5rem;
+}
+
+.metadata-actions button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  background-color: #f5f5f5;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.metadata-actions button:hover {
+  background-color: #e9e9e9;
+}
+
+.metadata-actions button.primary {
+  background-color: #0066cc;
+  color: white;
+  border-color: #0055aa;
+}
+
+.metadata-actions button.primary:hover {
+  background-color: #0055aa;
+}
+
+.metadata-section {
+  margin: 1rem 0;
+}
+
+.metadata-section h2 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.2rem;
+  color: #333;
+}
+
+.metadata-section p {
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: #666;
+}

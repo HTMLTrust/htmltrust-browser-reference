@@ -1,0 +1,169 @@
+/**
+ * Content script styles
+ */
+
+/* Content outline styles */
+.cs-content-outline {
+  position: relative;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  padding: 8px;
+  margin: 4px 0;
+  transition: border-color 0.2s ease;
+}
+
+/* Verified content outline */
+.cs-verified-content {
+  border-color: #4CAF50;
+}
+
+/* Unverified content outline */
+.cs-unverified-content {
+  border-color: #F44336;
+}
+
+/* Unknown content outline */
+.cs-unknown-content {
+  border-color: #FFC107;
+}
+
+/* Verification badge container */
+.cs-verification-badges {
+  position: absolute;
+  top: -10px;
+  right: 10px;
+  display: flex;
+  gap: 4px;
+  z-index: 1000;
+}
+
+/* Verification badge base styles */
+.cs-verification-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* Validity badges */
+.cs-validity-badge {
+  color: white;
+}
+
+/* Verified badge */
+.cs-verification-badge-verified {
+  background-color: #4CAF50;
+}
+
+/* Unverified badge */
+.cs-verification-badge-unverified {
+  background-color: #F44336;
+}
+
+/* Trust badges */
+.cs-trust-badge {
+  color: white;
+}
+
+/* Trusted badge */
+.cs-trust-badge-trusted {
+  background-color: #2196F3;
+}
+
+/* Untrusted badge */
+.cs-trust-badge-untrusted {
+  background-color: #9C27B0;
+}
+
+/* Unknown trust badge */
+.cs-trust-badge-unknown {
+  background-color: #FFC107;
+  color: #333;
+}
+
+/* Tooltip styles */
+.cs-tooltip {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background-color: #333;
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 1001;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  pointer-events: none;
+}
+
+.cs-verification-badge:hover .cs-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Vote buttons container */
+.cs-vote-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  justify-content: center;
+}
+
+/* Vote button base styles */
+.cs-vote-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  background-color: #555;
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+  border: none;
+  transition: background-color 0.2s ease;
+  padding: 0;
+}
+
+/* Upvote button */
+.cs-upvote-button {
+  background-color: #555;
+}
+
+.cs-upvote-button:hover {
+  background-color: #4CAF50;
+}
+
+.cs-upvote-button.cs-vote-button-active {
+  background-color: #4CAF50;
+}
+
+/* Downvote button */
+.cs-downvote-button {
+  background-color: #555;
+}
+
+.cs-downvote-button:hover {
+  background-color: #F44336;
+}
+
+.cs-downvote-button.cs-vote-button-active {
+  background-color: #F44336;
+}
+
+/* Make tooltip clickable when it contains vote buttons */
+.cs-verification-badge .cs-tooltip {
+  pointer-events: auto;
+  min-width: 120px;
+  text-align: center;
+}
