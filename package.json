@@ -46,6 +46,7 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
+    "@htmltrust/canonicalization": "github:HTMLTrust/htmltrust-canonicalization#v0.1.0",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
     "js-sha256": "^0.11.0",
