@@ -3,7 +3,7 @@
  */
 import React, { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Settings, Profile } from '../../core/common';
+import { Settings, Profile, getTrustDirectoryUrls } from '../../core/common';
 import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_PROFILE } from '../../core/common/constants';
 import { PlatformAdapter, MessageContext } from '../../platforms/common';
 import { ProfileManager } from '../../ui/components';
@@ -451,19 +451,89 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
         
         <div className="option-group">
           <h2>Trust Directory Settings</h2>
-          
+
           <div className="option">
-            <label>
-              Trust Directory URL
-              <input
-                type="text"
-                value={state.settings.trustDirectoryUrl}
-                onChange={(e) => handleSettingChange('trustDirectoryUrl', e.target.value)}
-                placeholder="https://api.trustdirectory.example.com"
-              />
+            <label htmlFor="trustDirectoryUrls">
+              Trust Directory URLs
             </label>
+            <textarea
+              id="trustDirectoryUrls"
+              value={(getTrustDirectoryUrls(state.settings)).join('\n')}
+              onChange={(e) => {
+                // One URL per line; empty lines and surrounding whitespace are
+                // trimmed at save time. Order matters: the resolver chain
+                // tries each directory in order until one resolves a keyid.
+                const list = e.target.value
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                handleSettingChange('trustDirectoryUrls', list);
+                // Clear the legacy single-URL field so getTrustDirectoryUrls
+                // never falls back to it once the user has explicitly set
+                // the list (even to empty).
+                handleSettingChange('trustDirectoryUrl', '');
+              }}
+              placeholder={'https://eff.org/directory\nhttps://aclu.org/directory'}
+              rows={4}
+              style={{ width: '100%', fontFamily: 'monospace' }}
+            />
             <p className="option-description">
-              The URL of the trust directory API
+              One trust directory base URL per line. The keyid resolver chain
+              consults these after did:web and direct-URL resolution. Leave
+              empty if you only verify keyids that are themselves URLs or
+              did:web identifiers.
+            </p>
+          </div>
+        </div>
+
+        <div className="option-group">
+          <h2>Personal Trust Policy</h2>
+
+          <div className="option">
+            <label htmlFor="personalTrustList">
+              Personal Trust List (keyids)
+            </label>
+            <textarea
+              id="personalTrustList"
+              value={(state.settings.personalTrustList ?? []).join('\n')}
+              onChange={(e) => {
+                const list = e.target.value
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                handleSettingChange('personalTrustList', list);
+              }}
+              placeholder={'did:web:alice.example\nhttps://server.example/api/authors/abc/public-key'}
+              rows={4}
+              style={{ width: '100%', fontFamily: 'monospace' }}
+            />
+            <p className="option-description">
+              One keyid per line. Verified content signed by these keyids
+              receives a +40 boost in the trust score (spec §3.1, option A).
+            </p>
+          </div>
+
+          <div className="option">
+            <label htmlFor="trustedDomains">
+              Trusted Domains
+            </label>
+            <textarea
+              id="trustedDomains"
+              value={(state.settings.trustedDomains ?? []).join('\n')}
+              onChange={(e) => {
+                const list = e.target.value
+                  .split('\n')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                handleSettingChange('trustedDomains', list);
+              }}
+              placeholder={'nytimes.com\npropublica.org'}
+              rows={4}
+              style={{ width: '100%', fontFamily: 'monospace' }}
+            />
+            <p className="option-description">
+              One domain per line. Verified content whose signature binds to
+              one of these domains receives a +30 boost (spec §3.1, option B).
             </p>
           </div>
         </div>

@@ -243,14 +243,53 @@ export interface Settings {
   highlightVerified: boolean;
   /** Whether to highlight unverified content */
   highlightUnverified: boolean;
-  /** The trust directory URL */
-  trustDirectoryUrl: string;
+  /**
+   * The trust directory URL.
+   * @deprecated Use `trustDirectoryUrls` (a list of directory base URLs).
+   * Retained for back-compat with persisted settings; on read, normalize to
+   * the list form via getTrustDirectoryUrls(settings).
+   */
+  trustDirectoryUrl?: string;
+  /**
+   * Trust directory base URLs used by the keyid resolver chain (third
+   * resolver after did:web and direct URL). Order matters: the first
+   * directory that resolves a keyid wins.
+   */
+  trustDirectoryUrls?: string[];
+  /**
+   * User's personal trust list, expressed as keyid strings (typically
+   * did:web identifiers or direct public-key URLs). Empty by default;
+   * keyids in this list contribute +40 to the policy score per spec §3.1.
+   */
+  personalTrustList?: string[];
+  /**
+   * Domains the user explicitly trusts. Empty by default; matching domains
+   * contribute +30 to the policy score per spec §3.1.
+   */
+  trustedDomains?: string[];
   /** The user's preferred authentication method */
   authMethod: 'apikey' | 'webauthn' | 'password';
   /** Server configurations for the Content Signing API */
   serverConfigs: ServerConfig[];
   /** ID of the active server configuration */
   activeServerId?: string;
+}
+
+/**
+ * Normalize the (possibly legacy) trust-directory settings to a list. Returns
+ * the explicit list if present, otherwise wraps the single legacy URL in a
+ * one-element array, otherwise returns an empty array. Caller should use this
+ * as the single source of truth for "the directories the resolver chain and
+ * the policy evaluator will consult".
+ */
+export function getTrustDirectoryUrls(settings: Pick<Settings, 'trustDirectoryUrls' | 'trustDirectoryUrl'>): string[] {
+  if (settings.trustDirectoryUrls && settings.trustDirectoryUrls.length > 0) {
+    return settings.trustDirectoryUrls.filter((u) => u && u.trim().length > 0);
+  }
+  if (settings.trustDirectoryUrl && settings.trustDirectoryUrl.trim().length > 0) {
+    return [settings.trustDirectoryUrl.trim()];
+  }
+  return [];
 }
 
 /**

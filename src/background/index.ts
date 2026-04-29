@@ -2,14 +2,18 @@
  * Background script entry point
  */
 import {
+  verifySignedSection,
+  defaultResolverChain,
+} from "@htmltrust/browser-client";
+import {
   Settings,
   VerificationResult,
   ServerConfig,
-  ContentSignature,
   VoteType,
   AuthorVote,
   BatchedVotesPayload,
   BatchVoteResult,
+  getTrustDirectoryUrls,
 } from "../core/common";
 import {
   STORAGE_KEYS,
@@ -195,166 +199,109 @@ async function getVerificationStatus(url: string): Promise<any> {
 }
 
 /**
- * Verify content at a URL
- * @param url The URL to verify content at
- * @returns The verification result
+ * Verify content at a URL.
+ *
+ * This is the popup-driven verification path: when the user clicks
+ * "Verify Content" in the popup, the popup messages this function. We do
+ * the crypto step locally in the page context (where SubtleCrypto is
+ * available on a secure origin) using @htmltrust/browser-client, and
+ * cache the result so the popup can display it.
+ *
+ * The trust server is NOT contacted for verification (the deprecated
+ * /api/content/verify endpoint has been removed). Author lookup for the
+ * "verified by ..." display is best-effort and falls back to the keyid.
+ *
+ * The auto-verify content script (content-scripts/index.ts) renders inline
+ * badges on page load without involving this function; that path is
+ * preferred for normal browsing. This function exists for the popup's
+ * explicit on-demand verify and as the source of truth for the cached
+ * VerificationResult that the popup reads via GET_VERIFICATION_STATUS.
  */
 async function verifyContent(url: string): Promise<any> {
   try {
-    // Get the current tab
     const currentTab = await platformAdapter.getCurrentTab();
 
-    // Execute a script to extract the content
-    const extractedContent = await platformAdapter.executeScript<any>(
+    // Step 1: pull the signed-section's outerHTML out of the page. The lib
+    // accepts an HTML fragment string, so we don't need to round-trip a
+    // full DOM Element across the messaging boundary. Returns null when
+    // the page has no signed-section, which we map to a clear failure.
+    // executeScript wraps the body in a function, so the body needs an
+    // explicit top-level return (not just an IIFE expression).
+    const sectionHtml = await platformAdapter.executeScript<string | null>(
       currentTab.id,
-      `
-      (() => {
-        const contentProcessor = new ContentProcessor();
-        return contentProcessor.extractContent(document);
-      })()
-    `,
+      `const section = document.querySelector('signed-section[signature]');
+       return section ? section.outerHTML : null;`,
     );
 
-    // Get the active server configuration
-    const activeServer = authService.getActiveServerConfig();
-    if (!activeServer) {
-      throw new Error("No active server configuration found");
-    }
-
-    // Get the Content Signing client
-    const contentSigningClient = authService.getContentSigningClient();
-    if (!contentSigningClient) {
-      throw new Error("Content Signing client not initialized");
-    }
-
-    // Try to find a signature for this content
-    // This is a simplified approach - in a real implementation, we would need a more robust
-    // mechanism to discover signatures (e.g., from meta tags, linked manifests, or directory lookup)
-    let signature: ContentSignature | null = null;
-    let authorId: string | null = null;
-
-    // Option 1: Check for signature in <signed-section> elements
-    const metaTags = await platformAdapter.executeScript<any>(
-      currentTab.id,
-      `
-      (() => {
-        const signed = document.querySelector('signed-section[signature]');
-        if (!signed) return { signature: null, authorId: null, keyid: null, algorithm: null, contentHash: null, innerMeta: {} };
-        const keyid = signed.getAttribute('keyid') || '';
-        // Extract authorId from keyid URL (last path segment before /public-key)
-        const keyidParts = keyid.replace(/\\/public-key$/, '').split('/');
-        const authorId = keyidParts[keyidParts.length - 1] || null;
-
-        // Read inner metadata from <meta> tags
-        const metas = signed.querySelectorAll('meta');
-        const innerMeta = {};
-        metas.forEach(m => {
-          const name = m.getAttribute('name');
-          const content = m.getAttribute('content');
-          if (name && content) innerMeta[name] = content;
-        });
-
-        return {
-          signature: signed.getAttribute('signature'),
-          authorId: authorId,
-          keyid: keyid,
-          algorithm: signed.getAttribute('algorithm'),
-          contentHash: signed.getAttribute('content-hash'),
-          innerMeta: innerMeta
-        };
-      })()
-    `,
-    );
-
-    if (metaTags.signature && metaTags.authorId) {
-      // Build claims from inner meta tags (claim:* entries)
-      const innerClaims: Record<string, string> = {};
-      const innerMeta = metaTags.innerMeta || {};
-      for (const [key, value] of Object.entries(innerMeta)) {
-        if (key.startsWith("claim:")) {
-          innerClaims[key.slice("claim:".length)] = value as string;
-        }
-      }
-      signature = {
-        contentHash: extractedContent.contentHash,
-        domain: new URL(url).hostname,
-        authorId: metaTags.authorId,
-        signature: metaTags.signature,
-        claims: innerClaims,
-      };
-      authorId = metaTags.authorId;
-    }
-
-    // Option 2: If no signature found in signed-section, try to search the directory
-    if (!signature && !authorId) {
-      try {
-        const searchResult = await contentSigningClient.searchSignedContent({
-          contentHash: extractedContent.contentHash,
-        });
-
-        if (searchResult.signatures.length > 0) {
-          // Use the first signature found
-          const foundSignature = searchResult.signatures[0];
-          signature = {
-            contentHash: foundSignature.contentHash,
-            domain: foundSignature.domain,
-            authorId: foundSignature.authorId,
-            signature: foundSignature.signature,
-            claims: foundSignature.claims,
-          };
-          authorId = foundSignature.authorId;
-        }
-      } catch (error) {
-        console.error("Failed to search for signatures:", error);
-        // Continue with verification attempt if we have a signature from meta tags
-      }
-    }
-
-    // If we found a signature, verify it
     let verificationResult: VerificationResult;
 
-    if (signature && authorId) {
-      try {
-        const result = await contentSigningClient.verifyContent(
-          extractedContent.contentHash,
-          new URL(url).hostname,
-          authorId,
-          signature.signature,
-        );
-
-        verificationResult = {
-          verified: result.valid,
-          reason: result.valid ? undefined : "Signature verification failed",
-          verifiedAt: Date.now(),
-          domain: new URL(url).hostname,
-          user: result.author
-            ? {
-                id: result.author.id,
-                name: result.author.name,
-                email: "", // Not provided by the API
-                publicKey: "", // We would need to fetch this separately
-                verified: true,
-              }
-            : undefined,
-          trustStatus: result.valid ? "trusted" : "untrusted",
-        };
-      } catch (error) {
-        verificationResult = {
-          verified: false,
-          reason: `Verification error: ${(error as Error).message}`,
-          verifiedAt: Date.now(),
-          domain: new URL(url).hostname,
-          trustStatus: "unknown",
-        };
-      }
-    } else {
+    if (!sectionHtml) {
       verificationResult = {
         verified: false,
-        reason: "No signature found for this content",
+        reason: "No signed-section found on this page",
         verifiedAt: Date.now(),
         domain: new URL(url).hostname,
         trustStatus: "unknown",
       };
+    } else {
+      // Step 2: verify locally (Layer 1, spec §3.1). We run in the
+      // background service worker context, which has SubtleCrypto. The
+      // resolver chain is built from the user's configured directory list;
+      // empty list still works for did:web and direct-URL keyids.
+      const directories = getTrustDirectoryUrls(settings);
+      const resolverChain = defaultResolverChain({ directories });
+
+      const verify = await verifySignedSection(sectionHtml, {
+        keyResolvers: resolverChain,
+        domain: new URL(url).hostname,
+      });
+
+      // Best-effort author name lookup. The author DB is server-side and
+      // optional; if we can't fetch it (the keyid isn't a server URL or
+      // the server is unreachable) the verified state still holds — we
+      // just show the keyid in place of a friendly name.
+      const keyid = verify.keyid || "";
+      const authorIdMatch = keyid.match(/\/authors\/([^/]+)/);
+      const authorId = authorIdMatch ? authorIdMatch[1] : null;
+
+      if (verify.valid) {
+        let userName = keyid || "unknown";
+        let userId = authorId || keyid;
+        if (authorId) {
+          try {
+            const csClient = authService.getContentSigningClient();
+            if (csClient) {
+              const author = await csClient.getAuthor(authorId);
+              userName = author.name;
+              userId = author.id;
+            }
+          } catch {
+            // Author lookup failed; not fatal. Verification status is unaffected.
+          }
+        }
+
+        verificationResult = {
+          verified: true,
+          verifiedAt: Date.now(),
+          domain: new URL(url).hostname,
+          user: {
+            id: userId,
+            name: userName,
+            email: "",
+            publicKey: "",
+            verified: true,
+          },
+          trustStatus: "trusted",
+        };
+      } else {
+        verificationResult = {
+          verified: false,
+          reason: verify.reason || "Signature verification failed",
+          verifiedAt: Date.now(),
+          domain: new URL(url).hostname,
+          trustStatus: "untrusted",
+        };
+      }
     }
 
     // Cache the verification result
@@ -365,7 +312,6 @@ async function verifyContent(url: string): Promise<any> {
     verificationResults[url] = verificationResult;
     await storage.set(STORAGE_KEYS.VERIFICATION_RESULTS, verificationResults);
 
-    // Update the badge
     updateBadge();
 
     return {
