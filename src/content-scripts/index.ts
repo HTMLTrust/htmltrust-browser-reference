@@ -71,26 +71,11 @@ function applyVerificationUI(verificationResult: VerificationResult) {
 }
 
 /**
- * Find content elements on the page
- * @returns An array of content elements
+ * Find HTMLTrust signed-section elements on the page
+ * @returns An array of signed-section elements (empty if none found)
  */
 function findContentElements(): Element[] {
-  // Try to find main content containers first
-  const mainContainers = Array.from(document.querySelectorAll('article, main, [role="main"], .content, #content'));
-  
-  if (mainContainers.length > 0) {
-    return mainContainers;
-  }
-  
-  // If no main containers found, look for sections or large text blocks
-  const sections = Array.from(document.querySelectorAll('section, .post, #post, .entry, #entry'));
-  
-  if (sections.length > 0) {
-    return sections;
-  }
-  
-  // If still nothing found, use paragraphs and headings
-  return Array.from(document.querySelectorAll('p, h1, h2, h3, h4, h5, h6'));
+  return Array.from(document.querySelectorAll('signed-section'));
 }
 
 /**

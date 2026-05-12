@@ -5,7 +5,7 @@
 /* Content outline styles */
 .cs-content-outline {
   position: relative;
-  border: 2px solid transparent;
+  border: 1px dotted rgba(128, 128, 128, 0.4);
   border-radius: 4px;
   padding: 8px;
   margin: 4px 0;
@@ -14,17 +14,17 @@
 
 /* Verified content outline */
 .cs-verified-content {
-  border-color: #4CAF50;
+  border-color: rgba(76, 175, 80, 0.4);
 }
 
 /* Unverified content outline */
 .cs-unverified-content {
-  border-color: #F44336;
+  border-color: rgba(244, 67, 54, 0.4);
 }
 
 /* Unknown content outline */
 .cs-unknown-content {
-  border-color: #FFC107;
+  border-color: rgba(255, 193, 7, 0.4);
 }
 
 /* Verification badge container */
