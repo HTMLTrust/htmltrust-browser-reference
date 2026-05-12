@@ -1,7 +1,34 @@
 /**
- * Content Signing API client
+ * Content Signing API client.
+ *
+ * Layered into two responsibilities:
+ *
+ *   1. Local cryptographic verification of signed-section content. This is
+ *      the spec-aligned (§3.1) path: the extension verifies signatures
+ *      itself via @htmltrust/browser-client, which uses SubtleCrypto and a
+ *      pluggable resolver chain (did:web → direct URL → trust directories)
+ *      to fetch keys. NO trust server is contacted for verification.
+ *
+ *   2. Author/key/content management operations against a trust server.
+ *      These are the admin/author-side flows (creating authors, signing
+ *      content via remote authorities, voting). These remain server-backed
+ *      because they require server-held secrets (author API keys) and
+ *      mutate server state.
+ *
+ * The deprecated /api/content/verify endpoint is no longer called. Callers
+ * who previously invoked verifyContent() should call verifySignedSectionLocal()
+ * (or use the lib directly) instead. verifyContent() is preserved as a thin
+ * compatibility wrapper that delegates to the local verifier when given a
+ * signed-section element/HTML, and otherwise returns a "verification requires
+ * the signed-section element, not a server lookup" failure result.
  */
 import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import {
+  verifySignedSection,
+  defaultResolverChain,
+  type VerifyResult,
+} from '@htmltrust/browser-client';
+import type { KeyResolver } from '@htmltrust/browser-client';
 import { Author, PublicKey, ContentSignature, Claim, KeyReputation, ContentOccurrence, ServerConfig, VoteType, BatchedVotesPayload, BatchVoteResult } from '../common/types';
 import { ERROR_CODES, API_ENDPOINTS } from '../common/constants';
 import { createError } from '../common/utils';
@@ -14,6 +41,31 @@ export interface ContentSigningClientOptions {
   baseUrl: string;
   /** The timeout for API requests in milliseconds */
   timeout?: number;
+  /**
+   * Trust directory base URLs to use as a fallback in the resolver chain.
+   * The default chain (did:web → direct URL) handles most keyids; directories
+   * are only consulted for keyids that match neither of the first two shapes.
+   */
+  trustDirectories?: string[];
+}
+
+/**
+ * Local verification options. Mirrors the lib's VerifyOptions shape but with
+ * defaults filled in from the client's configured trust directories.
+ */
+export interface LocalVerifyOptions {
+  /** The signed-section element or its outerHTML. */
+  section: Element | string;
+  /** Domain to bind the signature to. Defaults to window.location.hostname. */
+  domain?: string;
+  /** Optional override of the resolver chain (overrides client-configured directories). */
+  keyResolvers?: KeyResolver[];
+  /**
+   * Optional override of the SHA-256 implementation. Used by environments where
+   * SubtleCrypto is unavailable (plain HTTP test pages); production browsers
+   * should always have SubtleCrypto on a secure context.
+   */
+  hash?: (canonical: string) => Promise<string>;
 }
 
 /**
@@ -22,6 +74,8 @@ export interface ContentSigningClientOptions {
 export class ContentSigningClient {
   private client: AxiosInstance;
   private baseUrl: string;
+  private trustDirectories: string[];
+  private resolverChain: KeyResolver[];
 
   /**
    * Create a new Content Signing API client
@@ -29,7 +83,12 @@ export class ContentSigningClient {
    */
   constructor(options: ContentSigningClientOptions) {
     this.baseUrl = options.baseUrl;
-    
+    this.trustDirectories = options.trustDirectories ?? [];
+    // Build the resolver chain once. did:web and directUrl are always present;
+    // trust directories are appended only when configured (they're a network
+    // lookup of last resort).
+    this.resolverChain = defaultResolverChain({ directories: this.trustDirectories });
+
     const config: AxiosRequestConfig = {
       baseURL: options.baseUrl,
       timeout: options.timeout || 10000,
@@ -42,17 +101,31 @@ export class ContentSigningClient {
   }
 
   /**
+   * Update the trust directory list and rebuild the resolver chain.
+   * Called when the user edits the directory list in extension settings.
+   */
+  setTrustDirectories(directories: string[]): void {
+    this.trustDirectories = directories;
+    this.resolverChain = defaultResolverChain({ directories });
+  }
+
+  /** Get the configured resolver chain (for callers that want to reuse it). */
+  getResolverChain(): KeyResolver[] {
+    return this.resolverChain;
+  }
+
+  /**
    * Set the API key for authenticated requests
    * @param apiKey The API key to use
    * @param keyType The type of API key (author, general, admin)
    */
   setApiKey(apiKey: string, keyType: 'author' | 'general' | 'admin'): void {
-    const headerName = keyType === 'author' 
-      ? 'X-AUTHOR-API-KEY' 
-      : keyType === 'admin' 
-        ? 'X-ADMIN-API-KEY' 
+    const headerName = keyType === 'author'
+      ? 'X-AUTHOR-API-KEY'
+      : keyType === 'admin'
+        ? 'X-ADMIN-API-KEY'
         : 'X-API-KEY';
-    
+
     this.client.defaults.headers.common[headerName] = apiKey;
   }
 
@@ -61,13 +134,28 @@ export class ContentSigningClient {
    * @param keyType The type of API key to clear (author, general, admin)
    */
   clearApiKey(keyType: 'author' | 'general' | 'admin'): void {
-    const headerName = keyType === 'author' 
-      ? 'X-AUTHOR-API-KEY' 
-      : keyType === 'admin' 
-        ? 'X-ADMIN-API-KEY' 
+    const headerName = keyType === 'author'
+      ? 'X-AUTHOR-API-KEY'
+      : keyType === 'admin'
+        ? 'X-ADMIN-API-KEY'
         : 'X-API-KEY';
-    
+
     delete this.client.defaults.headers.common[headerName];
+  }
+
+  /**
+   * Locally verify a signed-section element using @htmltrust/browser-client.
+   *
+   * This is the spec §3.1 path: the browser does its own crypto verification
+   * via SubtleCrypto, with key resolution handled by the configured resolver
+   * chain. No trust server is contacted for verification.
+   */
+  async verifySignedSectionLocal(opts: LocalVerifyOptions): Promise<VerifyResult> {
+    return verifySignedSection(opts.section, {
+      keyResolvers: opts.keyResolvers ?? this.resolverChain,
+      domain: opts.domain,
+      hash: opts.hash,
+    });
   }
 
   /**
@@ -80,7 +168,7 @@ export class ContentSigningClient {
    * @returns A promise that resolves with the created author and API key
    */
   async createAuthor(
-    name: string, 
+    name: string,
     keyType: 'HUMAN' | 'AI' | 'HUMAN_AI_MIX' | 'ORGANIZATION',
     description?: string,
     url?: string,
@@ -102,11 +190,6 @@ export class ContentSigningClient {
 
   /**
    * Get a list of authors
-   * @param name Optional filter by author name
-   * @param keyType Optional filter by key type
-   * @param page Optional page number
-   * @param limit Optional number of items per page
-   * @returns A promise that resolves with a list of authors and pagination info
    */
   async listAuthors(
     name?: string,
@@ -130,8 +213,6 @@ export class ContentSigningClient {
 
   /**
    * Get author details
-   * @param authorId The ID of the author
-   * @returns A promise that resolves with the author details
    */
   async getAuthor(authorId: string): Promise<Author> {
     try {
@@ -144,9 +225,6 @@ export class ContentSigningClient {
 
   /**
    * Update author details
-   * @param authorId The ID of the author
-   * @param updates The updates to apply
-   * @returns A promise that resolves with the updated author
    */
   async updateAuthor(
     authorId: string,
@@ -162,8 +240,6 @@ export class ContentSigningClient {
 
   /**
    * Delete an author
-   * @param authorId The ID of the author
-   * @returns A promise that resolves when the author is deleted
    */
   async deleteAuthor(authorId: string): Promise<void> {
     try {
@@ -175,8 +251,9 @@ export class ContentSigningClient {
 
   /**
    * Get an author's public key
-   * @param authorId The ID of the author
-   * @returns A promise that resolves with the author's public key
+   *
+   * NOTE: this is server-side admin lookup; for verification, prefer the
+   * resolver chain (which handles did:web, direct URL, and trust directories).
    */
   async getAuthorPublicKey(authorId: string): Promise<PublicKey> {
     try {
@@ -188,11 +265,7 @@ export class ContentSigningClient {
   }
 
   /**
-   * Sign content
-   * @param contentHash The hash of the normalized content
-   * @param domain The domain associated with the content
-   * @param claims Claims about the content
-   * @returns A promise that resolves with the content signature
+   * Sign content (server-mediated, requires author API key).
    */
   async signContent(
     contentHash: string,
@@ -212,37 +285,35 @@ export class ContentSigningClient {
   }
 
   /**
-   * Verify content signature
-   * @param contentHash The hash of the normalized content
-   * @param domain The domain associated with the content
-   * @param authorId The ID of the author who signed the content
-   * @param signature The cryptographic signature to verify
-   * @returns A promise that resolves with the verification result
+   * Verify content signature.
+   *
+   * @deprecated The trust server's POST /api/content/verify endpoint has been
+   * removed; verification is now performed locally per spec §3.1. This method
+   * is retained as a back-compat shim that returns a structured failure result
+   * indicating that callers should use verifySignedSectionLocal() instead. The
+   * background script has been migrated to call verifySignedSectionLocal()
+   * directly with the page's signed-section element.
+   *
+   * @returns Always { valid: false } with a descriptive reason.
    */
   async verifyContent(
-    contentHash: string,
-    domain: string,
-    authorId: string,
-    signature: string
-  ): Promise<{ valid: boolean; author?: Author; claims?: Record<string, any> }> {
-    try {
-      const response = await this.client.post(API_ENDPOINTS.CONTENT_VERIFY, {
-        contentHash,
-        domain,
-        authorId,
-        signature
-      });
-      return response.data;
-    } catch (error) {
-      throw this.handleApiError(error, 'Failed to verify content');
-    }
+    _contentHash: string,
+    _domain: string,
+    _authorId: string,
+    _signature: string
+  ): Promise<{ valid: boolean; author?: Author; claims?: Record<string, any>; reason?: string }> {
+    // Intentionally do not contact the server. The deprecated endpoint
+    // returned { valid, author, claims }; we surface a clear failure so
+    // legacy code paths fail loudly rather than silently regressing trust.
+    return {
+      valid: false,
+      reason:
+        'verifyContent() is deprecated; use verifySignedSectionLocal() (or @htmltrust/browser-client verifySignedSection) for spec §3.1 local verification',
+    };
   }
 
   /**
    * List claim types
-   * @param page Optional page number
-   * @param limit Optional number of items per page
-   * @returns A promise that resolves with a list of claim types and pagination info
    */
   async listClaimTypes(
     page?: number,
@@ -262,8 +333,6 @@ export class ContentSigningClient {
 
   /**
    * Get claim type details
-   * @param claimId The ID of the claim type
-   * @returns A promise that resolves with the claim type details
    */
   async getClaimType(claimId: string): Promise<Claim> {
     try {
@@ -276,8 +345,6 @@ export class ContentSigningClient {
 
   /**
    * Search public keys
-   * @param params Search parameters
-   * @returns A promise that resolves with a list of public keys and pagination info
    */
   async searchPublicKeys(params: {
     authorName?: string;
@@ -286,9 +353,9 @@ export class ContentSigningClient {
     minTrustScore?: number;
     page?: number;
     limit?: number;
-  }): Promise<{ 
-    keys: Array<PublicKey & { author: Author; trustScore: number }>; 
-    pagination: { total: number; pages: number; page: number; limit: number } 
+  }): Promise<{
+    keys: Array<PublicKey & { author: Author; trustScore: number }>;
+    pagination: { total: number; pages: number; page: number; limit: number }
   }> {
     try {
       const response = await this.client.get(API_ENDPOINTS.DIRECTORY_KEYS, { params });
@@ -300,8 +367,6 @@ export class ContentSigningClient {
 
   /**
    * Get key reputation
-   * @param keyId The ID of the public key
-   * @returns A promise that resolves with the key reputation
    */
   async getKeyReputation(keyId: string): Promise<KeyReputation> {
     try {
@@ -314,11 +379,6 @@ export class ContentSigningClient {
 
   /**
    * Report a key
-   * @param keyId The ID of the public key
-   * @param reason The reason for reporting
-   * @param details Optional additional details
-   * @param evidence Optional URL to evidence
-   * @returns A promise that resolves with the report status
    */
   async reportKey(
     keyId: string,
@@ -340,8 +400,6 @@ export class ContentSigningClient {
 
   /**
    * Search signed content
-   * @param params Search parameters
-   * @returns A promise that resolves with a list of content signatures and pagination info
    */
   async searchSignedContent(params: {
     contentHash?: string;
@@ -350,9 +408,9 @@ export class ContentSigningClient {
     claim?: string;
     page?: number;
     limit?: number;
-  }): Promise<{ 
-    signatures: Array<ContentSignature & { author: Author; occurrences: number }>; 
-    pagination: { total: number; pages: number; page: number; limit: number } 
+  }): Promise<{
+    signatures: Array<ContentSignature & { author: Author; occurrences: number }>;
+    pagination: { total: number; pages: number; page: number; limit: number }
   }> {
     try {
       const response = await this.client.get(API_ENDPOINTS.DIRECTORY_CONTENT, { params });
@@ -364,18 +422,14 @@ export class ContentSigningClient {
 
   /**
    * Find content occurrences
-   * @param contentHash The hash of the content
-   * @param page Optional page number
-   * @param limit Optional number of items per page
-   * @returns A promise that resolves with a list of content occurrences and pagination info
    */
   async findContentOccurrences(
     contentHash: string,
     page?: number,
     limit?: number
-  ): Promise<{ 
-    occurrences: ContentOccurrence[]; 
-    pagination: { total: number; pages: number; page: number; limit: number } 
+  ): Promise<{
+    occurrences: ContentOccurrence[];
+    pagination: { total: number; pages: number; page: number; limit: number }
   }> {
     try {
       const params: Record<string, any> = {};
@@ -391,11 +445,6 @@ export class ContentSigningClient {
 
   /**
    * Report content misuse
-   * @param contentHash The hash of the content being reported
-   * @param sourceUrl The original source URL of the content
-   * @param targetUrl The URL where the content is being misused
-   * @param reason The reason for reporting
-   * @returns A promise that resolves with the report status
    */
   async reportContentMisuse(
     contentHash: string,
@@ -418,8 +467,6 @@ export class ContentSigningClient {
 
   /**
    * Submit a batch of author votes
-   * @param votes A map of author IDs to vote types
-   * @returns A promise that resolves with the batch vote result
    */
   async submitBatchedVotes(votes: BatchedVotesPayload): Promise<BatchVoteResult> {
     try {
@@ -434,9 +481,6 @@ export class ContentSigningClient {
 
   /**
    * Submit a vote for a specific author
-   * @param authorId The ID of the author to vote on
-   * @param vote The type of vote to cast
-   * @returns A promise that resolves when the vote is submitted
    * @deprecated Use submitBatchedVotes instead
    */
   async submitAuthorVote(authorId: string, vote: VoteType): Promise<void> {
@@ -451,15 +495,12 @@ export class ContentSigningClient {
 
   /**
    * Handle API errors
-   * @param error The error to handle
-   * @param defaultMessage The default error message
-   * @returns A standardized error object
    */
   private handleApiError(error: any, defaultMessage: string): never {
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
       const message = error.response?.data?.message || error.message || defaultMessage;
-      
+
       if (status === 401 || status === 403) {
         throw createError(ERROR_CODES.AUTH_ERROR, message, error);
       } else if (status === 400) {
@@ -468,7 +509,7 @@ export class ContentSigningClient {
         throw createError(ERROR_CODES.NETWORK_ERROR, message, error);
       }
     }
-    
+
     throw createError(ERROR_CODES.UNKNOWN_ERROR, defaultMessage, error);
   }
 }

@@ -13,14 +13,25 @@ export const EXTENSION_NAME = 'Content Signing';
 export const EXTENSION_VERSION = '1.0.0';
 
 /**
- * Default settings for the extension
+ * Default settings for the extension.
+ *
+ * trustDirectoryUrls is the canonical form (list of directory base URLs).
+ * trustDirectoryUrl is preserved for back-compat with persisted settings
+ * from older versions; new code should always read via
+ * getTrustDirectoryUrls(settings) which normalizes both shapes.
+ *
+ * personalTrustList and trustedDomains start empty; the user populates them
+ * via the options page. They feed the lib's evaluateTrustPolicy directly.
  */
 export const DEFAULT_SETTINGS = {
   autoVerify: true,
   showBadges: true,
   highlightVerified: true,
   highlightUnverified: false,
-  trustDirectoryUrl: 'https://api.trustdirectory.example.com',
+  trustDirectoryUrls: [] as string[],
+  trustDirectoryUrl: '', // legacy, unused if trustDirectoryUrls is populated
+  personalTrustList: [] as string[],
+  trustedDomains: [] as string[],
   authMethod: 'apikey' as const,
   serverConfigs: [
     {

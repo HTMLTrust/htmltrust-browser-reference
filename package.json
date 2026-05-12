@@ -38,6 +38,7 @@
     "eslint": "^9.25.1",
     "html-webpack-plugin": "^5.6.3",
     "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0",
     "style-loader": "^4.0.0",
     "ts-jest": "^29.3.2",
     "ts-loader": "^9.5.2",
@@ -46,7 +47,8 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
-    "@htmltrust/canonicalization": "github:HTMLTrust/htmltrust-canonicalization#v0.1.0",
+    "@htmltrust/browser-client": "file:../../htmltrust-browser-client",
+    "@htmltrust/canonicalization": "file:../../htmltrust-canonicalization/javascript",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
     "js-sha256": "^0.11.0",

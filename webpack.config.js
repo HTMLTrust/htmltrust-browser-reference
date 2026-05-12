@@ -1,4 +1,5 @@
 const path = require('path');
+const webpack = require('webpack');
 const CopyPlugin = require('copy-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 
@@ -67,6 +68,18 @@ module.exports = {
     },
   },
   plugins: [
+    // @htmltrust/canonicalization (a peer of @htmltrust/browser-client) has
+    // a runtime fallback to node:crypto for use in Node.js environments. In
+    // a browser bundle that import path is dead code (the runtime check
+    // `typeof process !== 'undefined' && process.versions?.node` is false at
+    // page-script runtime), but webpack still tries to resolve the dynamic
+    // import at build time. IgnorePlugin tells webpack to skip the module
+    // entirely; the dynamic import becomes a runtime ModuleNotFoundError
+    // that the canonicalization lib catches and treats as "no Node crypto
+    // available", which is the correct browser-side behavior.
+    new webpack.IgnorePlugin({
+      resourceRegExp: /^node:crypto$/,
+    }),
     new CopyPlugin({
       patterns: [
         { from: browserConfig.manifestPath, to: 'manifest.json' },

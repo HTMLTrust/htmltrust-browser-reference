@@ -1,10 +1,44 @@
 /**
- * Content script entry point
+ * Content script entry point.
+ *
+ * Two responsibilities:
+ *
+ *   1. Auto-verify on page load. On DOMContentLoaded (the manifest registers
+ *      this script as document_idle equivalent for content_scripts), find
+ *      every <signed-section[signature]> on the page, verify each via
+ *      @htmltrust/browser-client (Layer 1, SubtleCrypto-backed), evaluate the
+ *      trust policy locally (Layer 2), and inject the corresponding badges
+ *      inline next to each section. No popup interaction required.
+ *
+ *   2. Preserve the existing popup-driven flow. The background script can
+ *      still push a richer VerificationResult via UPDATE_VERIFICATION_UI, in
+ *      which case we apply the legacy whole-page highlighting/badges. This
+ *      keeps the popup "Verify Content" button working and supports any
+ *      flows that need server-side enrichment (e.g. author name lookups).
+ *
+ * Verification is local: the trust server is never contacted for the
+ * crypto step. Trust directories are consulted only by the resolver chain
+ * (third in line after did:web and direct URL resolvers).
  */
+import {
+  verifySignedSection,
+  evaluateTrustPolicy,
+  defaultResolverChain,
+  type VerifyResult,
+  type TrustEvaluation,
+  type TrustInput,
+  type KeyResolver,
+} from '@htmltrust/browser-client';
 import { MESSAGE_TYPES, CSS_CLASSES, TRUST_STATUS, STORAGE_KEYS } from '../core/common/constants';
 import { ContentProcessor } from '../core/content';
 import { PlatformAdapter, MessageContext } from '../platforms/common';
-import { VerificationResult, TrustStatus, VoteType, AuthorVote } from '../core/common/types';
+import {
+  VerificationResult,
+  TrustStatus,
+  VoteType,
+  Settings,
+  getTrustDirectoryUrls,
+} from '../core/common/types';
 
 // Import platform-specific adapter
 // This will be replaced with the correct adapter at build time
@@ -13,30 +47,54 @@ import { ChromiumAdapter } from '../platforms/chromium';
 // Initialize platform adapter
 const platformAdapter: PlatformAdapter = new ChromiumAdapter();
 
-// Initialize content processor
+// Initialize content processor (used by the legacy heuristic-content path)
 const contentProcessor = new ContentProcessor();
 
+/** Marker class on the auto-verify badge container, used to avoid duplicates. */
+const AUTO_BADGE_MARKER = 'cs-auto-verification-badges';
+
 /**
- * Initialize the content script
+ * Pull authorId out of a `.../authors/{id}/public-key` keyid URL. Returns
+ * null for keyids that aren't in this shape (e.g. did:web identifiers).
+ * Used purely for badge data attributes and vote button wiring.
+ */
+function authorIdFromKeyid(keyid: string): string | null {
+  if (!keyid) return null;
+  const m = keyid.match(/\/authors\/([^/]+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Initialize the content script.
+ *
+ * Three things happen here, in this order:
+ *   1. Read settings from storage (resolver chain needs the directory list,
+ *      policy evaluator needs personal trust list / trusted domains).
+ *   2. Auto-verify every signed-section on the page.
+ *   3. Notify the background script that content was detected (for the popup
+ *      status display) and listen for any UPDATE_VERIFICATION_UI follow-ups.
+ *
+ * Errors in any single signed-section don't abort the page; each section is
+ * verified independently, and a failure to load settings falls back to an
+ * empty resolver chain (still verifies any did:web or direct-URL keyids).
  */
 async function initialize() {
   try {
     console.log('Content Signing content script initialized');
 
-    // Extract content from the page
-    const extractedContent = contentProcessor.extractContent(document);
+    // 1. Settings → resolver chain + trust policy inputs
+    const settings = await loadSettings();
+    const directories = getTrustDirectoryUrls(settings);
+    const resolverChain = defaultResolverChain({ directories });
 
-    // Notify the background script that content was detected
-    const response = await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
-      type: MESSAGE_TYPES.CONTENT_DETECTED,
-      url: window.location.href,
-      content: extractedContent,
-    });
+    // 2. Auto-verify on page load. Idempotent: re-running is a no-op for
+    //    sections that already have an auto badge container next to them.
+    await autoVerifyPage(resolverChain, settings);
 
-    // If we received a response, apply the verification UI
-    if (response) {
-      applyVerificationUI(response);
-    }
+    // 3. Legacy popup path: notify background, optionally apply richer UI
+    //    on UPDATE_VERIFICATION_UI messages. This is best-effort and
+    //    independent of the auto-verify result above.
+    await notifyContentDetected();
 
     // Listen for messages from the background script
     listenForMessages();
@@ -46,8 +104,231 @@ async function initialize() {
 }
 
 /**
- * Apply verification UI to the page
- * @param verificationResult The verification result
+ * Load settings from extension storage. On any error, returns a minimal
+ * default that's safe for the resolver chain (no directories) and the
+ * policy evaluator (empty trust lists). The user can fix this in the
+ * options page and the next page load picks up the change.
+ */
+async function loadSettings(): Promise<Settings> {
+  try {
+    const storage = platformAdapter.getStorage();
+    const stored = await storage.get<Settings>(STORAGE_KEYS.SETTINGS);
+    if (stored) return stored;
+  } catch (err) {
+    console.warn('Content Signing: failed to load settings; using defaults', err);
+  }
+  // Minimal Settings-shaped default. We can't import DEFAULT_SETTINGS here
+  // because it pulls in the constants module which may grow other deps;
+  // the fields below are the only ones this script reads.
+  return {
+    autoVerify: true,
+    showBadges: true,
+    highlightVerified: true,
+    highlightUnverified: false,
+    trustDirectoryUrls: [],
+    personalTrustList: [],
+    trustedDomains: [],
+    authMethod: 'apikey',
+    serverConfigs: [],
+  };
+}
+
+/**
+ * Walk every <signed-section[signature]> on the page and verify it locally.
+ *
+ * Each section is verified independently — a failure on one does not skip
+ * the others. Badges are inserted as the next sibling of the section
+ * element, matching the e2e harness's visual placement.
+ *
+ * Idempotent: if a section already has an auto-badge sibling, it's skipped.
+ * This protects against re-runs (e.g. the script being injected twice on a
+ * page that does its own DOM manipulation).
+ */
+async function autoVerifyPage(
+  resolverChain: KeyResolver[],
+  settings: Settings,
+): Promise<void> {
+  const sections = document.querySelectorAll('signed-section[signature]');
+  if (sections.length === 0) {
+    // Graceful no-op: pages without signed-sections are common and not an error.
+    return;
+  }
+
+  const domain = window.location.hostname;
+  const personalTrustList = settings.personalTrustList ?? [];
+  const trustedDomains = settings.trustedDomains ?? [];
+
+  for (const section of Array.from(sections)) {
+    // Idempotency: skip if we've already verified this section.
+    if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
+      continue;
+    }
+
+    try {
+      const verify = await verifySignedSection(section, {
+        keyResolvers: resolverChain,
+        domain,
+      });
+
+      // Layer 2: trust policy. directorySubscriptions is intentionally empty
+      // here — the spec-compliant `<dir>/keys/<keyid>/reputation` endpoint
+      // shape is not yet implemented by the reference trust server. The e2e
+      // harness layers reports/score on top via a custom server lookup; the
+      // extension follows the same TODO pattern and stays out of that
+      // business until the server endpoint exists.
+      // TODO(directory-shape): wire `directorySubscriptions` once the trust
+      // server exposes `/keys/{keyid}/reputation` per spec.
+      const trust = await evaluateTrustPolicy(verify, {
+        personalTrustList,
+        trustedDomains,
+        directorySubscriptions: [],
+      });
+
+      const badges = buildAutoBadges(verify, trust);
+      section.parentNode?.insertBefore(badges, section.nextSibling);
+    } catch (err) {
+      console.error('Content Signing: verification failed for a signed-section', err);
+      // Render an explicit failure badge so the user can see something went
+      // wrong; without this the section would silently appear unverified.
+      const errBadges = buildErrorBadges((err as Error).message ?? 'verification error');
+      section.parentNode?.insertBefore(errBadges, section.nextSibling);
+    }
+  }
+}
+
+/**
+ * Build the inline badge container for a successful or failed verification.
+ *
+ * Matches the e2e harness's visual style (playwright-session.ts lines
+ * 312-360) so consumer-facing screenshots and the live extension look the
+ * same. CSS classes also match the existing content.css file so the
+ * stylesheet shipped with the extension styles them correctly.
+ */
+function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElement {
+  const authorId = verify.keyid ? authorIdFromKeyid(verify.keyid) : null;
+
+  const badges = document.createElement('div');
+  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
+  badges.setAttribute('data-author-id', authorId ?? '');
+  badges.setAttribute('data-trust-score', String(trust.score));
+  badges.setAttribute('data-keyid', verify.keyid ?? '');
+  badges.style.cssText =
+    'display: flex; gap: 8px; padding: 8px; margin: 8px 0; font-family: sans-serif; font-size: 14px; align-items: center; flex-wrap: wrap;';
+
+  // Signature validity badge
+  const sigBadge = document.createElement('span');
+  if (verify.valid) {
+    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
+    sigBadge.textContent = '✓ Signature valid';
+    sigBadge.style.cssText =
+      'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
+  } else {
+    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
+    sigBadge.textContent = `✗ Signature INVALID${verify.reason ? ` (${verify.reason})` : ''}`;
+    sigBadge.style.cssText =
+      'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
+  }
+  badges.appendChild(sigBadge);
+
+  // Trust badge — color reflects the policy evaluator's indicator.
+  const trustBadge = document.createElement('span');
+  const trustClass =
+    trust.indicator === 'green'
+      ? CSS_CLASSES.TRUST_BADGE_TRUSTED
+      : trust.indicator === 'red'
+      ? CSS_CLASSES.TRUST_BADGE_UNTRUSTED
+      : CSS_CLASSES.TRUST_BADGE_UNKNOWN;
+  trustBadge.className = `${CSS_CLASSES.TRUST_BADGE} ${trustClass}`;
+  trustBadge.textContent = `Trust: ${trust.score}%`;
+  if (trust.indicator === 'green') {
+    trustBadge.style.cssText =
+      'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
+  } else if (trust.indicator === 'red') {
+    trustBadge.style.cssText =
+      'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
+  } else {
+    trustBadge.style.cssText =
+      'background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px;';
+  }
+  // Hover tooltip: per-input rationale, useful for debugging / auditability.
+  trustBadge.title = trust.inputs
+    .map((r: TrustInput) => `${r.source}: ${r.contribution} (${r.rationale})`)
+    .join('\n');
+  badges.appendChild(trustBadge);
+
+  // Vote buttons (wired only when we extracted an authorId; did:web keyids
+  // are skipped because the existing vote API is keyed by authorId, not keyid).
+  if (authorId) {
+    badges.appendChild(buildVoteButton(CSS_CLASSES.UPVOTE_BUTTON, '👍 Trust', authorId, VoteType.UPVOTE));
+    badges.appendChild(buildVoteButton(CSS_CLASSES.DOWNVOTE_BUTTON, '👎 Distrust', authorId, VoteType.DOWNVOTE));
+  }
+
+  return badges;
+}
+
+function buildVoteButton(
+  cssClass: string,
+  label: string,
+  authorId: string,
+  vote: VoteType,
+): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.className = `${CSS_CLASSES.VOTE_BUTTON} ${cssClass}`;
+  btn.textContent = label;
+  btn.dataset.authorId = authorId;
+  btn.dataset.voteType = vote;
+  btn.style.cssText =
+    'cursor: pointer; padding: 4px 8px; border: 1px solid #ccc; background: white; border-radius: 4px;';
+  btn.addEventListener('click', handleVoteButtonClick);
+  return btn;
+}
+
+function buildErrorBadges(reason: string): HTMLElement {
+  const badges = document.createElement('div');
+  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
+  badges.style.cssText =
+    'display: flex; gap: 8px; padding: 8px; margin: 8px 0; font-family: sans-serif; font-size: 14px; align-items: center;';
+  const sigBadge = document.createElement('span');
+  sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
+  sigBadge.textContent = `✗ Verification error: ${reason}`;
+  sigBadge.style.cssText =
+    'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
+  badges.appendChild(sigBadge);
+  return badges;
+}
+
+/**
+ * Notify background that content was detected. This drives the popup's
+ * "current page" status display and is independent of the auto-verify
+ * badges injected above. Failures here are non-fatal.
+ */
+async function notifyContentDetected(): Promise<void> {
+  try {
+    // Use legacy heuristic-based content extraction for the popup; the
+    // auto-verify path uses the actual signed-section element directly.
+    const extractedContent = contentProcessor.extractContent(document);
+
+    const response = await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
+      type: MESSAGE_TYPES.CONTENT_DETECTED,
+      url: window.location.href,
+      content: extractedContent,
+    });
+
+    if (response) {
+      applyVerificationUI(response);
+    }
+  } catch (err) {
+    // Background may legitimately have no enrichment to offer (no signature
+    // found in legacy paths). Don't pollute the console for this case.
+    console.debug('Content Signing: notifyContentDetected returned no enrichment', err);
+  }
+}
+
+/**
+ * Apply legacy verification UI driven by the background script. Kept for
+ * back-compat with the popup → background → content-script enrichment
+ * flow. The auto-verify path above is what the user sees by default; this
+ * only runs if the background pushes a result.
  */
 function applyVerificationUI(verificationResult: VerificationResult) {
   try {
@@ -60,7 +341,7 @@ function applyVerificationUI(verificationResult: VerificationResult) {
 
     // Find content elements to highlight
     const contentElements = findContentElements();
-    
+
     // Apply verification UI to each content element
     contentElements.forEach(element => {
       applyVerificationUIToElement(element, verificationResult, settings);
@@ -80,9 +361,6 @@ function findContentElements(): Element[] {
 
 /**
  * Apply verification UI to a specific element
- * @param element The element to apply verification UI to
- * @param verificationResult The verification result
- * @param settings The settings for the verification UI
  */
 function applyVerificationUIToElement(
   element: Element,
@@ -91,7 +369,7 @@ function applyVerificationUIToElement(
 ) {
   // Add content outline class
   element.classList.add(CSS_CLASSES.CONTENT_OUTLINE);
-  
+
   // Determine verification status class
   if (verificationResult.verified) {
     if (settings.highlightVerified) {
@@ -102,7 +380,7 @@ function applyVerificationUIToElement(
       element.classList.add(CSS_CLASSES.UNVERIFIED_CONTENT);
     }
   }
-  
+
   // Add verification badges if enabled
   if (settings.showBadges) {
     addVerificationBadges(element, verificationResult);
@@ -111,23 +389,21 @@ function applyVerificationUIToElement(
 
 /**
  * Add verification badges to an element
- * @param element The element to add badges to
- * @param verificationResult The verification result
  */
 function addVerificationBadges(element: Element, verificationResult: VerificationResult) {
   try {
     // Create badge container
     const badgeContainer = document.createElement('div');
     badgeContainer.className = CSS_CLASSES.VERIFICATION_BADGES;
-    
+
     // Add validity badge
     const validityBadge = createValidityBadge(verificationResult);
     badgeContainer.appendChild(validityBadge);
-    
+
     // Add trust badge
     const trustBadge = createTrustBadge(verificationResult);
     badgeContainer.appendChild(trustBadge);
-    
+
     // Add the badge container to the element
     element.appendChild(badgeContainer);
   } catch (error) {
@@ -135,156 +411,118 @@ function addVerificationBadges(element: Element, verificationResult: Verificatio
   }
 }
 
-/**
- * Create a validity badge
- * @param verificationResult The verification result
- * @returns The validity badge element
- */
 function createValidityBadge(verificationResult: VerificationResult): HTMLElement {
   const badge = document.createElement('span');
   badge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  
+
   if (verificationResult.verified) {
     badge.classList.add(CSS_CLASSES.VERIFICATION_BADGE_VERIFIED);
     badge.textContent = '✓';
-    
-    // Add tooltip
+
     const tooltip = document.createElement('span');
     tooltip.className = CSS_CLASSES.TOOLTIP;
     tooltip.textContent = `Verified by ${verificationResult.user?.name || 'unknown'}`;
-    
-    // Add vote buttons if we have an author ID
+
     if (verificationResult.user?.id) {
       const voteButtons = createVoteButtons(verificationResult.user.id);
       tooltip.appendChild(voteButtons);
     }
-    
+
     badge.appendChild(tooltip);
   } else {
     badge.classList.add(CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED);
     badge.textContent = '✗';
-    
-    // Add tooltip
+
     const tooltip = document.createElement('span');
     tooltip.className = CSS_CLASSES.TOOLTIP;
     tooltip.textContent = verificationResult.reason || 'Not verified';
     badge.appendChild(tooltip);
   }
-  
+
   return badge;
 }
 
-/**
- * Create a trust badge
- * @param verificationResult The verification result
- * @returns The trust badge element
- */
 function createTrustBadge(verificationResult: VerificationResult): HTMLElement {
   const badge = document.createElement('span');
   badge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.TRUST_BADGE}`;
-  
-  // Determine trust status
+
   const trustStatus = determineTrustStatus(verificationResult);
-  
+
   switch (trustStatus) {
-    case TRUST_STATUS.TRUSTED:
+    case TRUST_STATUS.TRUSTED: {
       badge.classList.add(CSS_CLASSES.TRUST_BADGE_TRUSTED);
       badge.textContent = '🔒';
-      
-      // Add tooltip
       const trustedTooltip = document.createElement('span');
       trustedTooltip.className = CSS_CLASSES.TOOLTIP;
       trustedTooltip.textContent = `Trusted source: ${verificationResult.domain || 'unknown domain'}`;
       badge.appendChild(trustedTooltip);
       break;
-      
-    case TRUST_STATUS.UNTRUSTED:
+    }
+    case TRUST_STATUS.UNTRUSTED: {
       badge.classList.add(CSS_CLASSES.TRUST_BADGE_UNTRUSTED);
       badge.textContent = '⚠️';
-      
-      // Add tooltip
       const untrustedTooltip = document.createElement('span');
       untrustedTooltip.className = CSS_CLASSES.TOOLTIP;
       untrustedTooltip.textContent = `Untrusted source: ${verificationResult.domain || 'unknown domain'}`;
       badge.appendChild(untrustedTooltip);
       break;
-      
+    }
     case TRUST_STATUS.UNKNOWN:
-    default:
+    default: {
       badge.classList.add(CSS_CLASSES.TRUST_BADGE_UNKNOWN);
       badge.textContent = '?';
-      
-      // Add tooltip
       const unknownTooltip = document.createElement('span');
       unknownTooltip.className = CSS_CLASSES.TOOLTIP;
       unknownTooltip.textContent = `Unknown source: ${verificationResult.domain || 'unknown domain'}`;
       badge.appendChild(unknownTooltip);
       break;
+    }
   }
-  
+
   return badge;
 }
 
-/**
- * Create vote buttons for an author
- * @param authorId The ID of the author to vote on
- * @returns The vote buttons container element
- */
 function createVoteButtons(authorId: string): HTMLElement {
-  // Create container
   const container = document.createElement('div');
   container.className = CSS_CLASSES.VOTE_BUTTONS;
-  
-  // Create upvote button
+
   const upvoteButton = document.createElement('button');
   upvoteButton.className = `${CSS_CLASSES.VOTE_BUTTON} ${CSS_CLASSES.UPVOTE_BUTTON}`;
   upvoteButton.textContent = '👍';
   upvoteButton.title = 'Upvote this author';
   upvoteButton.dataset.authorId = authorId;
   upvoteButton.dataset.voteType = VoteType.UPVOTE;
-  
-  // Create downvote button
+
   const downvoteButton = document.createElement('button');
   downvoteButton.className = `${CSS_CLASSES.VOTE_BUTTON} ${CSS_CLASSES.DOWNVOTE_BUTTON}`;
   downvoteButton.textContent = '👎';
   downvoteButton.title = 'Downvote this author';
   downvoteButton.dataset.authorId = authorId;
   downvoteButton.dataset.voteType = VoteType.DOWNVOTE;
-  
-  // Add event listeners
+
   upvoteButton.addEventListener('click', handleVoteButtonClick);
   downvoteButton.addEventListener('click', handleVoteButtonClick);
-  
-  // Add buttons to container
+
   container.appendChild(upvoteButton);
   container.appendChild(downvoteButton);
-  
-  // Check if we have an existing vote for this author and update UI accordingly
+
   checkExistingVote(authorId, upvoteButton, downvoteButton);
-  
+
   return container;
 }
 
-/**
- * Check if there's an existing vote for an author and update button states
- * @param authorId The ID of the author
- * @param upvoteButton The upvote button element
- * @param downvoteButton The downvote button element
- */
 async function checkExistingVote(
   authorId: string,
   upvoteButton: HTMLButtonElement,
   downvoteButton: HTMLButtonElement
 ): Promise<void> {
   try {
-    // Request the current vote state from the background script
     const response = await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
       type: 'GET_AUTHOR_VOTE',
       authorId,
     });
-    
+
     if (response && response.vote) {
-      // Update button states based on current vote
       if (response.vote === VoteType.UPVOTE) {
         upvoteButton.classList.add(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
         downvoteButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
@@ -301,100 +539,75 @@ async function checkExistingVote(
   }
 }
 
-/**
- * Handle vote button click
- * @param event The click event
- */
 async function handleVoteButtonClick(event: MouseEvent): Promise<void> {
   event.preventDefault();
   event.stopPropagation();
-  
+
   const button = event.currentTarget as HTMLButtonElement;
   const authorId = button.dataset.authorId;
   const voteType = button.dataset.voteType as VoteType;
-  
+
   if (!authorId || !voteType) {
     console.error('Missing authorId or voteType in vote button');
     return;
   }
-  
-  // Determine if this is a toggle (clicking already active button)
+
   const isToggle = button.classList.contains(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
   const finalVoteType = isToggle ? VoteType.NEUTRAL : voteType;
-  
-  // Find the container and buttons once to use throughout the function
+
   const container = button.parentElement;
   const upvoteButton = container?.querySelector(`.${CSS_CLASSES.UPVOTE_BUTTON}`) as HTMLButtonElement;
   const downvoteButton = container?.querySelector(`.${CSS_CLASSES.DOWNVOTE_BUTTON}`) as HTMLButtonElement;
-  
+
   try {
-    // Find the other button (to update its state)
     const otherButton = voteType === VoteType.UPVOTE ? downvoteButton : upvoteButton;
-    
-    // Update button states immediately for responsive UI
+
     if (finalVoteType === VoteType.NEUTRAL) {
-      // Remove active state if toggling off
       button.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
     } else {
-      // Set this button as active and remove active from other button
       button.classList.add(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
       if (otherButton) {
         otherButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
       }
     }
-    
-    // Send vote to background script
+
     await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
       type: MESSAGE_TYPES.SUBMIT_VOTE,
       authorId,
       vote: finalVoteType,
       url: window.location.href,
-      contentHash: null, // Could be added if we have access to the content hash
+      contentHash: null,
     });
-    
+
     console.log(`Vote ${finalVoteType} submitted for author ${authorId}`);
   } catch (error) {
     console.error('Failed to submit vote:', error);
-    // Revert UI changes on error
     if (upvoteButton && downvoteButton) {
       checkExistingVote(authorId, upvoteButton, downvoteButton);
     }
   }
 }
 
-/**
- * Determine the trust status of a verification result
- * @param verificationResult The verification result
- * @returns The trust status
- */
 function determineTrustStatus(verificationResult: VerificationResult): TrustStatus {
-  // If the trust status is already set, use it
   if (verificationResult.trustStatus) {
     return verificationResult.trustStatus;
   }
-  
-  // If not verified, it's untrusted
+
   if (!verificationResult.verified) {
     return TRUST_STATUS.UNTRUSTED;
   }
-  
-  // If there's a trust directory entry, it's trusted
+
   if (verificationResult.trustDirectoryEntry) {
     return TRUST_STATUS.TRUSTED;
   }
-  
-  // If there's a user but no trust directory entry, check if the user is verified
+
   if (verificationResult.user) {
     return verificationResult.user.verified ? TRUST_STATUS.TRUSTED : TRUST_STATUS.UNTRUSTED;
   }
-  
-  // Otherwise, it's unknown
+
   return TRUST_STATUS.UNKNOWN;
 }
 
-/**
- * Listen for messages from the background script
- */
 function listenForMessages() {
   platformAdapter.registerMessageListeners({
     [MessageContext.BACKGROUND]: async (message: any) => {
@@ -403,7 +616,6 @@ function listenForMessages() {
           applyVerificationUI(message.verificationResult);
           return { success: true };
         case MESSAGE_TYPES.VOTE_ACKNOWLEDGED:
-          // Update vote button states if needed
           if (message.authorId) {
             const upvoteButtons = document.querySelectorAll(
               `.${CSS_CLASSES.UPVOTE_BUTTON}[data-author-id="${message.authorId}"]`
@@ -411,7 +623,7 @@ function listenForMessages() {
             const downvoteButtons = document.querySelectorAll(
               `.${CSS_CLASSES.DOWNVOTE_BUTTON}[data-author-id="${message.authorId}"]`
             );
-            
+
             upvoteButtons.forEach((upvoteButton) => {
               downvoteButtons.forEach((downvoteButton) => {
                 checkExistingVote(
@@ -430,5 +642,17 @@ function listenForMessages() {
   });
 }
 
-// Initialize the content script
-initialize();
+/**
+ * Run on DOMContentLoaded so we have the full DOM (signed-section elements
+ * may be near the end of the body). The manifest also registers this
+ * script as a content_script so it auto-injects on every page load; the
+ * DOMContentLoaded check handles the rare case where the script is
+ * injected before the DOM is ready.
+ */
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    initialize();
+  });
+} else {
+  initialize();
+}
