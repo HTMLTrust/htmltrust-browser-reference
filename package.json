@@ -47,8 +47,8 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
-    "@htmltrust/browser-client": "file:../../htmltrust-browser-client",
-    "@htmltrust/canonicalization": "file:../../htmltrust-canonicalization/javascript",
+    "@htmltrust/browser-client": "file:../htmltrust-browser-client",
+    "@htmltrust/canonicalization": "file:../htmltrust-canonicalization/javascript",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
     "js-sha256": "^0.11.0",
