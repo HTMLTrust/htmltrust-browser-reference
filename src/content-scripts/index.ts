@@ -398,18 +398,19 @@ async function notifyContentDetected(): Promise<void> {
     // auto-verify path uses the actual signed-section element directly.
     const extractedContent = contentProcessor.extractContent(document);
 
-    const response = await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
+    // Best-effort notification. We deliberately ignore the response: the
+    // auto-verify path above already applied the authoritative UI based on
+    // the local verifier's result, and the legacy enrichment path would
+    // happily overwrite that with default "Untrusted / unknown domain"
+    // markers driven by a stale VerificationResult shape.
+    await platformAdapter.sendMessage(MessageContext.CONTENT, {
       type: MESSAGE_TYPES.CONTENT_DETECTED,
       url: window.location.href,
       content: extractedContent,
     });
-
-    if (response) {
-      applyVerificationUI(response);
-    }
   } catch (err) {
-    // Background may legitimately have no enrichment to offer (no signature
-    // found in legacy paths). Don't pollute the console for this case.
+    // Background may legitimately have no enrichment to offer. Don't pollute
+    // the console for this case.
     console.debug('Content Signing: notifyContentDetected returned no enrichment', err);
   }
 }
