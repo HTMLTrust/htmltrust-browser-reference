@@ -168,6 +168,7 @@ async function autoVerifyPage(
       const verify = await verifySignedSection(section, {
         keyResolvers: resolverChain,
         domain,
+        debug: true,
       });
 
       // Layer 2: trust policy. directorySubscriptions is intentionally empty
