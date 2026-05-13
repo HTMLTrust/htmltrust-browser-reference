@@ -229,6 +229,21 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
     }
   };
 
+  /**
+   * Quick toggle for settings.showBadges. Persists immediately so the next
+   * page load (or extension reload) reflects the change.
+   */
+  const handleToggleShowBadges = async (next: boolean) => {
+    const updated = { ...state.settings, showBadges: next };
+    setState(prevState => ({ ...prevState, settings: updated }));
+    try {
+      const storage = adapter.getStorage();
+      await storage.set(STORAGE_KEYS.SETTINGS, updated);
+    } catch (error) {
+      setState(prevState => ({ ...prevState, error: (error as Error).message }));
+    }
+  };
+
   const handleVerifyContent = async () => {
     try {
       setState(prevState => ({ ...prevState, isLoading: true }));
@@ -388,6 +403,20 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           <p>{state.currentUrl}</p>
         </div>
         
+        <div className="htmltrust-quick-settings" style={{ marginBottom: 12 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={state.settings.showBadges}
+              onChange={(e) => handleToggleShowBadges(e.target.checked)}
+            />
+            Show on-page badges
+          </label>
+          <p style={{ margin: '2px 0 0 22px', fontSize: 11, opacity: 0.7 }}>
+            Reload the page after toggling to apply.
+          </p>
+        </div>
+
         <div className="htmltrust-sections">
           <h2>HTMLTrust Sections{state.pageVerifications.length > 0 ? ` (${state.pageVerifications.length})` : ''}</h2>
           {!state.pageVerificationsLoaded ? (

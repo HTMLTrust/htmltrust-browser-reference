@@ -170,6 +170,13 @@ async function autoVerifyPage(
   resolverChain: KeyResolver[],
   settings: Settings,
 ): Promise<void> {
+  // `autoVerify` gates the entire content-script verification path. When off,
+  // the page is left untouched and the popup's "Verifying…" state stays put
+  // until the user explicitly triggers verification.
+  if (!settings.autoVerify) {
+    return;
+  }
+
   const sections = document.querySelectorAll('signed-section[signature]');
   if (sections.length === 0) {
     // Graceful no-op: pages without signed-sections are common and not an error.
@@ -210,7 +217,7 @@ async function autoVerifyPage(
         directorySubscriptions: [],
       });
 
-      applySectionStatusUI(section, verify, trust);
+      applySectionStatusUI(section, verify, trust, null, settings);
       pageVerifications.push({
         index: i,
         valid: verify.valid,
@@ -226,7 +233,7 @@ async function autoVerifyPage(
       });
     } catch (err) {
       console.error('Content Signing: verification failed for a signed-section', err);
-      applySectionStatusUI(section, null, null, (err as Error).message ?? 'verification error');
+      applySectionStatusUI(section, null, null, (err as Error).message ?? 'verification error', settings);
       pageVerifications.push({
         index: i,
         valid: false,
@@ -253,6 +260,11 @@ const SECTION_DECORATED_CLASS = 'cs-decorated';
  *   - dotted outline whose color reflects signature validity
  *   - tiny circular ✓/✗ badge in the top-right
  *
+ * Three settings gate what gets drawn:
+ *   - showBadges:         master switch. Off = no decoration at all.
+ *   - highlightVerified:  outline a valid signed-section in green.
+ *   - highlightUnverified: outline an invalid signed-section in red.
+ *
  * The user-facing detailed pills (Signature valid / Trust %) live in the
  * popup, not on the page.
  */
@@ -260,11 +272,22 @@ function applySectionStatusUI(
   section: Element,
   verify: VerifyResult | null,
   trust: TrustEvaluation | null,
-  errorReason: string | null = null,
+  errorReason: string | null,
+  settings: Settings,
 ): void {
-  section.classList.add(SECTION_DECORATED_CLASS, CSS_CLASSES.CONTENT_OUTLINE);
+  // Mark the section as decorated regardless of settings so we don't redo
+  // verification on it. (The verify result is already cached for the popup.)
+  section.classList.add(SECTION_DECORATED_CLASS);
+
+  // Master kill switch.
+  if (!settings.showBadges) return;
+
   const valid = verify?.valid === true;
-  section.classList.add(valid ? CSS_CLASSES.VERIFIED_CONTENT : CSS_CLASSES.UNVERIFIED_CONTENT);
+  if (valid && settings.highlightVerified) {
+    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.VERIFIED_CONTENT);
+  } else if (!valid && settings.highlightUnverified) {
+    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.UNVERIFIED_CONTENT);
+  }
 
   // Tooltip carries the human-readable status — popup is the rich surface.
   const reason = errorReason ?? verify?.reason ?? null;
