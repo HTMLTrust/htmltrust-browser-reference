@@ -22,7 +22,7 @@
   },
   "keywords": [],
   "author": "Jason Grey <jason@jason-grey.com>",
-  "license": "MIT",
+  "license": "LicenseRef-PolyForm-Noncommercial-1.0.0",
   "devDependencies": {
     "@types/chrome": "^0.0.317",
     "@types/firefox-webext-browser": "^120.0.4",
