@@ -114,7 +114,7 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
       await storage.set(STORAGE_KEYS.SETTINGS, state.settings);
       
       // Notify the background script that settings have changed
-      await adapter.sendMessage(MessageContext.BACKGROUND, {
+      await adapter.sendMessage(MessageContext.OPTIONS, {
         type: 'UPDATE_SETTINGS',
         settings: state.settings,
       });

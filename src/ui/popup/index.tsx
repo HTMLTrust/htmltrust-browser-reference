@@ -135,7 +135,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           profiles.find(p => p.isDefault)?.id || profiles[0].id;
         
         // Get the verification status for the current URL
-        const verificationResult = await adapter.sendMessage(MessageContext.BACKGROUND, {
+        const verificationResult = await adapter.sendMessage(MessageContext.POPUP, {
           type: 'GET_VERIFICATION_STATUS',
           url: currentTab.url,
         });
@@ -192,7 +192,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
       setState(prevState => ({ ...prevState, isLoading: true }));
       
       // Send a message to the background script to open the sign-in page
-      await adapter.sendMessage(MessageContext.BACKGROUND, {
+      await adapter.sendMessage(MessageContext.POPUP, {
         type: 'OPEN_SIGN_IN',
       });
       
@@ -211,7 +211,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
       setState(prevState => ({ ...prevState, isLoading: true }));
       
       // Send a message to the background script to sign out
-      await adapter.sendMessage(MessageContext.BACKGROUND, {
+      await adapter.sendMessage(MessageContext.POPUP, {
         type: 'SIGN_OUT',
       });
       
@@ -234,7 +234,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
       setState(prevState => ({ ...prevState, isLoading: true }));
       
       // Send a message to the background script to verify the content
-      const verificationResult = await adapter.sendMessage(MessageContext.BACKGROUND, {
+      const verificationResult = await adapter.sendMessage(MessageContext.POPUP, {
         type: 'VERIFY_CONTENT',
         url: state.currentUrl,
       });
@@ -273,7 +273,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
         state.profiles[0];
       
       // Send a message to the background script to sign the content
-      const signResult = await adapter.sendMessage(MessageContext.BACKGROUND, {
+      const signResult = await adapter.sendMessage(MessageContext.POPUP, {
         type: 'SIGN_CONTENT',
         url: state.currentUrl,
         metadata: state.metadata,
