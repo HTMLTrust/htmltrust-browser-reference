@@ -2,7 +2,7 @@
 
 Reference browser extension for client-side validation of HTMLTrust signed content. Verifies cryptographic signatures embedded in web pages using the `<signed-section>` element protocol.
 
-This is a companion to the [HTMLTrust specification](https://github.com/ArcadeLabsInc/htmltrust-spec).
+This is a companion to the [HTMLTrust specification](https://github.com/HTMLTrust/htmltrust-spec).
 
 ## What It Does
 
@@ -64,7 +64,7 @@ src/
 ### Build
 
 ```sh
-git clone https://github.com/ArcadeLabsInc/htmltrust-browser-reference.git
+git clone https://github.com/HTMLTrust/htmltrust-browser-reference.git
 cd htmltrust-browser-reference
 npm install
 ```
@@ -127,10 +127,10 @@ npm run test:coverage    # With coverage report
 
 | Repository | Description |
 |---|---|
-| [htmltrust-spec](https://github.com/ArcadeLabsInc/htmltrust-spec) | The HTMLTrust specification and paper |
-| [htmltrust-server-reference](https://github.com/ArcadeLabsInc/htmltrust-server-reference) | Reference trust directory API server |
-| [htmltrust-cms-reference](https://github.com/ArcadeLabsInc/htmltrust-cms-reference) | Reference CMS plugin (WordPress) |
-| [htmltrust-website](https://github.com/ArcadeLabsInc/htmltrust-website) | Project website |
+| [htmltrust-spec](https://github.com/HTMLTrust/htmltrust-spec) | The HTMLTrust specification and paper |
+| [htmltrust-server-reference](https://github.com/HTMLTrust/htmltrust-server-reference) | Reference trust directory API server |
+| [htmltrust-cms-reference](https://github.com/HTMLTrust/htmltrust-cms-reference) | Reference CMS plugin (WordPress) |
+| [htmltrust-website](https://github.com/HTMLTrust/htmltrust-website) | Project website |
 
 ## License
 
