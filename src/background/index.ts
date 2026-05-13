@@ -750,11 +750,14 @@ async function updateBadge(): Promise<void> {
     // Get the verification status for the current URL
     const status = await getVerificationStatus(currentTab.url);
 
-    // Set the badge based on the verification status
+    // Set the badge based on the verification status. Clearing the badge
+    // means setting text to empty; color must still be a valid color string
+    // because Chrome rejects an empty color spec ("The color specification
+    // could not be parsed").
     if (status.verified) {
       await platformAdapter.setBadge("✓", "#4CAF50");
     } else {
-      await platformAdapter.setBadge("", "");
+      await platformAdapter.setBadge("", "#00000000");
     }
   } catch (error) {
     console.error("Failed to update badge:", error);
