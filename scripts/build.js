@@ -28,16 +28,24 @@ const browsersToProcess = targetBrowser ? [targetBrowser] : browsers;
  */
 function buildExtension(browser) {
   console.log(`Building for ${browser}...`);
-  
+
   try {
+    // Wipe the output directory before every build. Webpack's `clean: true`
+    // mostly handles this, but files copied in by CopyPlugin (manifest +
+    // assets) or stragglers from earlier failed builds can persist, so a
+    // load-unpacked extension keeps reading stale code. rm -rf is reliable.
+    const outDir = path.resolve(__dirname, '..', 'build', browser);
+    fs.rmSync(outDir, { recursive: true, force: true });
+    fs.mkdirSync(outDir, { recursive: true });
+
     // Run webpack with the browser-specific configuration
     execSync(`cross-env TARGET_BROWSER=${browser} webpack --mode=production`, {
       stdio: 'inherit',
     });
-    
+
     // Create a zip file for the extension
     createZipFile(browser);
-    
+
     console.log(`Successfully built for ${browser}`);
   } catch (error) {
     console.error(`Failed to build for ${browser}:`, error);
@@ -52,27 +60,27 @@ function buildExtension(browser) {
 function createZipFile(browser) {
   const buildDir = path.resolve(__dirname, '..', 'build', browser);
   const zipFile = path.resolve(__dirname, '..', 'build', `content-signing-${browser}.zip`);
-  
+
   // Create a write stream for the zip file
   const output = fs.createWriteStream(zipFile);
   const archive = archiver('zip', {
     zlib: { level: 9 }, // Maximum compression
   });
-  
+
   // Listen for errors
   archive.on('error', (error) => {
     throw error;
   });
-  
+
   // Pipe the archive to the output file
   archive.pipe(output);
-  
+
   // Add the build directory to the archive
   archive.directory(buildDir, false);
-  
+
   // Finalize the archive
   archive.finalize();
-  
+
   console.log(`Created zip file: ${zipFile}`);
 }
 
