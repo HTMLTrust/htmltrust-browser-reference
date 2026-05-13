@@ -122,12 +122,17 @@ export class ChromiumAdapter implements PlatformAdapter {
    */
   registerMessageListeners(handlers: MessageHandlers): void {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      // Determine the context of the message
+      // Determine which handler should process this message. The popup and
+      // options pages tag their outgoing messages with an explicit context
+      // (popup / options); we honor that first. We only fall back to the
+      // `sender.tab` heuristic for content scripts that didn't bother
+      // tagging — without this ordering, the options page (which runs in a
+      // real tab via open_in_tab: true) would be misrouted as CONTENT.
       let context: MessageContext;
-      if (sender.tab) {
-        context = MessageContext.CONTENT;
-      } else if (message.context) {
+      if (message.context) {
         context = message.context;
+      } else if (sender.tab) {
+        context = MessageContext.CONTENT;
       } else {
         context = MessageContext.BACKGROUND;
       }
