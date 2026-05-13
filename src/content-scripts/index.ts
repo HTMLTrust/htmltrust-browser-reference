@@ -100,18 +100,25 @@ function authorIdFromKeyid(keyid: string): string | null {
  * verified independently, and a failure to load settings falls back to an
  * empty resolver chain (still verifies any did:web or direct-URL keyids).
  */
+/**
+ * Module-scoped runtime state. Kept here so the storage change listener can
+ * re-run autoVerifyPage with up-to-date settings without re-initializing.
+ */
+let currentSettings: Settings | null = null;
+let currentResolverChain: KeyResolver[] = [];
+
 async function initialize() {
   try {
     console.log('Content Signing content script initialized');
 
     // 1. Settings → resolver chain + trust policy inputs
-    const settings = await loadSettings();
-    const directories = getTrustDirectoryUrls(settings);
-    const resolverChain = defaultResolverChain({ directories });
+    currentSettings = await loadSettings();
+    const directories = getTrustDirectoryUrls(currentSettings);
+    currentResolverChain = defaultResolverChain({ directories });
 
     // 2. Auto-verify on page load. Idempotent: re-running is a no-op for
     //    sections that already have an auto badge container next to them.
-    await autoVerifyPage(resolverChain, settings);
+    await autoVerifyPage(currentResolverChain, currentSettings);
 
     // 3. Legacy popup path: notify background, optionally apply richer UI
     //    on UPDATE_VERIFICATION_UI messages. This is best-effort and
@@ -120,8 +127,70 @@ async function initialize() {
 
     // Listen for messages from the background script
     listenForMessages();
+
+    // Live-update on settings change. When the popup or options page writes
+    // a new SETTINGS value to chrome.storage, we clear our existing
+    // decorations and re-decorate using the cached verification results,
+    // so the user sees the effect of toggling on-page badges without
+    // having to reload the page (or the whole extension).
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local') return;
+        if (!changes[STORAGE_KEYS.SETTINGS]) return;
+        const next = changes[STORAGE_KEYS.SETTINGS].newValue as Settings | undefined;
+        if (!next) return;
+        currentSettings = next;
+        redecoratePage();
+      });
+    }
   } catch (error) {
     console.error('Failed to initialize content script:', error);
+  }
+}
+
+/**
+ * Strip the decorations we previously applied and re-apply using the
+ * currentSettings + cached pageVerifications. Called when the user toggles
+ * a setting that affects on-page badges.
+ */
+function redecoratePage(): void {
+  if (!currentSettings) return;
+  const sections = document.querySelectorAll(`signed-section[signature]`);
+  // Clear our existing additions on every section we've touched.
+  sections.forEach((section) => {
+    section.classList.remove(
+      SECTION_DECORATED_CLASS,
+      CSS_CLASSES.CONTENT_OUTLINE,
+      CSS_CLASSES.VERIFIED_CONTENT,
+      CSS_CLASSES.UNVERIFIED_CONTENT,
+    );
+    (section as HTMLElement).removeAttribute('title');
+    section.querySelectorAll(`.${AUTO_BADGE_MARKER}`).forEach((b) => b.remove());
+  });
+  // Re-apply using cached results so we don't rerun verification.
+  const list = Array.from(sections);
+  for (let i = 0; i < list.length && i < pageVerifications.length; i++) {
+    const cached = pageVerifications[i];
+    // Reconstruct a minimal VerifyResult/TrustEvaluation shape for the UI
+    // applier. The cache is intentionally a flat snapshot; the original
+    // objects don't survive across the listener boundary.
+    const verifyShape: VerifyResult = {
+      valid: cached.valid,
+      keyid: cached.keyid,
+      algorithm: cached.algorithm,
+      contentHash: '',
+      claimsHash: '',
+      claims: cached.claims,
+      signedAt: cached.signedAt,
+      domain: cached.domain,
+      reason: cached.reason ?? undefined,
+    };
+    const trustShape: TrustEvaluation = {
+      score: cached.trustScore,
+      indicator: cached.trustIndicator,
+      inputs: [],
+    };
+    applySectionStatusUI(list[i], verifyShape, trustShape, cached.reason, currentSettings);
   }
 }
 
