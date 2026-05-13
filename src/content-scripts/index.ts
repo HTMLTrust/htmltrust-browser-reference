@@ -54,6 +54,28 @@ const contentProcessor = new ContentProcessor();
 const AUTO_BADGE_MARKER = 'cs-auto-verification-badges';
 
 /**
+ * Per-section snapshot exposed to the popup via the GET_PAGE_VERIFICATIONS
+ * message. The popup is the user-facing surface for badge details; the page
+ * only carries quiet outline + corner-badge cues.
+ */
+type PageVerification = {
+  index: number;
+  valid: boolean;
+  reason: string | null;
+  trustScore: number;
+  trustIndicator: 'green' | 'yellow' | 'red';
+  trustLabel: string;
+  keyid: string;
+  algorithm: string;
+  signedAt: string;
+  domain: string;
+  claims: Record<string, string>;
+};
+
+/** Module-scoped cache of this page's verification results. */
+const pageVerifications: PageVerification[] = [];
+
+/**
  * Pull authorId out of a `.../authors/{id}/public-key` keyid URL. Returns
  * null for keyids that aren't in this shape (e.g. did:web identifiers).
  * Used purely for badge data attributes and vote button wiring.
@@ -158,9 +180,12 @@ async function autoVerifyPage(
   const personalTrustList = settings.personalTrustList ?? [];
   const trustedDomains = settings.trustedDomains ?? [];
 
+  pageVerifications.length = 0;
+
+  let i = 0;
   for (const section of Array.from(sections)) {
-    // Idempotency: skip if we've already verified this section.
-    if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
+    // Idempotency: skip sections we've already decorated.
+    if (section.classList.contains(SECTION_DECORATED_CLASS)) {
       continue;
     }
 
@@ -185,16 +210,80 @@ async function autoVerifyPage(
         directorySubscriptions: [],
       });
 
-      const badges = buildAutoBadges(verify, trust);
-      section.parentNode?.insertBefore(badges, section.nextSibling);
+      applySectionStatusUI(section, verify, trust);
+      pageVerifications.push({
+        index: i,
+        valid: verify.valid,
+        reason: verify.valid ? null : verify.reason ?? 'unknown',
+        trustScore: trust.score,
+        trustIndicator: trust.indicator,
+        trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+        keyid: verify.keyid,
+        algorithm: verify.algorithm,
+        signedAt: verify.signedAt,
+        domain: verify.domain,
+        claims: verify.claims ?? {},
+      });
     } catch (err) {
       console.error('Content Signing: verification failed for a signed-section', err);
-      // Render an explicit failure badge so the user can see something went
-      // wrong; without this the section would silently appear unverified.
-      const errBadges = buildErrorBadges((err as Error).message ?? 'verification error');
-      section.parentNode?.insertBefore(errBadges, section.nextSibling);
+      applySectionStatusUI(section, null, null, (err as Error).message ?? 'verification error');
+      pageVerifications.push({
+        index: i,
+        valid: false,
+        reason: (err as Error).message ?? 'verification error',
+        trustScore: 0,
+        trustIndicator: 'red',
+        trustLabel: 'Untrusted',
+        keyid: '',
+        algorithm: '',
+        signedAt: '',
+        domain,
+        claims: {},
+      });
     }
+    i++;
   }
+}
+
+/** Class added to a signed-section once we've decorated it. */
+const SECTION_DECORATED_CLASS = 'cs-decorated';
+
+/**
+ * Apply quiet, per-section visual cues directly to the signed-section:
+ *   - dotted outline whose color reflects signature validity
+ *   - tiny circular ✓/✗ badge in the top-right
+ *
+ * The user-facing detailed pills (Signature valid / Trust %) live in the
+ * popup, not on the page.
+ */
+function applySectionStatusUI(
+  section: Element,
+  verify: VerifyResult | null,
+  trust: TrustEvaluation | null,
+  errorReason: string | null = null,
+): void {
+  section.classList.add(SECTION_DECORATED_CLASS, CSS_CLASSES.CONTENT_OUTLINE);
+  const valid = verify?.valid === true;
+  section.classList.add(valid ? CSS_CLASSES.VERIFIED_CONTENT : CSS_CLASSES.UNVERIFIED_CONTENT);
+
+  // Tooltip carries the human-readable status — popup is the rich surface.
+  const reason = errorReason ?? verify?.reason ?? null;
+  const trustPart = trust ? ` · Trust: ${trust.score}% (${trust.indicator})` : '';
+  const tooltip = valid
+    ? `HTMLTrust: ✓ Signature valid${trustPart}`
+    : `HTMLTrust: ✗ Signature invalid${reason ? ` (${reason})` : ''}`;
+  (section as HTMLElement).title = tooltip;
+
+  const badges = document.createElement('div');
+  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
+  const sig = document.createElement('span');
+  sig.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VALIDITY_BADGE} ${
+    valid ? CSS_CLASSES.VERIFICATION_BADGE_VERIFIED : CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED
+  }`;
+  sig.textContent = valid ? '✓' : '✗';
+  sig.title = tooltip;
+  badges.appendChild(sig);
+  section.appendChild(badges);
 }
 
 /**
@@ -616,6 +705,14 @@ function listenForMessages() {
         case 'UPDATE_VERIFICATION_UI':
           applyVerificationUI(message.verificationResult);
           return { success: true };
+        case 'GET_PAGE_VERIFICATIONS':
+          // Popup reads the per-section results from here. Snapshot to keep
+          // the array immutable from the caller's perspective.
+          return {
+            url: window.location.href,
+            domain: window.location.hostname,
+            results: pageVerifications.slice(),
+          };
         case MESSAGE_TYPES.VOTE_ACKNOWLEDGED:
           if (message.authorId) {
             const upvoteButtons = document.querySelectorAll(

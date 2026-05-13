@@ -19,6 +19,24 @@ import { ChromiumAdapter } from '../../platforms/chromium';
 const platformAdapter: PlatformAdapter = new ChromiumAdapter();
 
 /**
+ * Per-section verification snapshot served by the content script.
+ * Mirrors PageVerification in src/content-scripts/index.ts.
+ */
+interface PageVerification {
+  index: number;
+  valid: boolean;
+  reason: string | null;
+  trustScore: number;
+  trustIndicator: 'green' | 'yellow' | 'red';
+  trustLabel: string;
+  keyid: string;
+  algorithm: string;
+  signedAt: string;
+  domain: string;
+  claims: Record<string, string>;
+}
+
+/**
  * Popup component props
  */
 interface PopupProps {
@@ -44,6 +62,24 @@ interface PopupState {
     openGraph: Record<string, string>;
     schemaOrg: Record<string, string>;
   };
+  pageVerifications: PageVerification[];
+  pageVerificationsLoaded: boolean;
+}
+
+/**
+ * Send GET_PAGE_VERIFICATIONS to the active tab's content script.
+ * Returns an empty list on any error so the popup always renders.
+ */
+async function loadPageVerifications(): Promise<PageVerification[]> {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs[0];
+    if (!tab?.id) return [];
+    const reply = await chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_VERIFICATIONS' });
+    return Array.isArray(reply?.results) ? (reply.results as PageVerification[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -65,7 +101,9 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
       dublinCore: {},
       openGraph: {},
       schemaOrg: {}
-    }
+    },
+    pageVerifications: [],
+    pageVerificationsLoaded: false,
   });
 
   useEffect(() => {
@@ -121,7 +159,21 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           isVerified: verificationResult?.verified || false,
           verificationStatus: verificationResult?.status || 'Not verified',
           showMetadataInput: false,
-          metadata: initialMetadata
+          metadata: initialMetadata,
+          pageVerifications: [],
+          pageVerificationsLoaded: false,
+        });
+
+        // Pull per-section results from the active tab's content script.
+        // Best-effort: pages without signed-section content reply with
+        // results=[] (or with nothing at all if the content script never
+        // initialized), and we treat both the same.
+        loadPageVerifications().then((results) => {
+          setState((prev) => ({
+            ...prev,
+            pageVerifications: results,
+            pageVerificationsLoaded: true,
+          }));
         });
       } catch (error) {
         setState(prevState => ({
@@ -336,7 +388,81 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           <p>{state.currentUrl}</p>
         </div>
         
-        <div className="verification-status">
+        <div className="htmltrust-sections">
+          <h2>HTMLTrust Sections{state.pageVerifications.length > 0 ? ` (${state.pageVerifications.length})` : ''}</h2>
+          {!state.pageVerificationsLoaded ? (
+            <p style={{ opacity: 0.7 }}>Verifying…</p>
+          ) : state.pageVerifications.length === 0 ? (
+            <p style={{ opacity: 0.7 }}>No signed sections on this page.</p>
+          ) : (
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+              {state.pageVerifications.map((v) => {
+                const bg = v.valid
+                  ? '#d4edda'
+                  : '#f8d7da';
+                const fg = v.valid ? '#155724' : '#721c24';
+                const trustBg =
+                  v.trustIndicator === 'green' ? '#d4edda'
+                  : v.trustIndicator === 'red' ? '#f8d7da'
+                  : '#fff3cd';
+                const trustFg =
+                  v.trustIndicator === 'green' ? '#155724'
+                  : v.trustIndicator === 'red' ? '#721c24'
+                  : '#856404';
+                return (
+                  <li
+                    key={v.index}
+                    style={{
+                      border: '1px solid #ddd',
+                      borderRadius: 4,
+                      padding: 8,
+                      marginBottom: 8,
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
+                      <span style={{ background: bg, color: fg, padding: '2px 8px', borderRadius: 4 }}>
+                        {v.valid ? '✓ Signature valid' : `✗ Signature invalid${v.reason ? ` (${v.reason})` : ''}`}
+                      </span>
+                      <span style={{ background: trustBg, color: trustFg, padding: '2px 8px', borderRadius: 4 }}>
+                        Trust {v.trustScore}% · {v.trustLabel}
+                      </span>
+                    </div>
+                    {v.keyid ? (
+                      <div style={{ wordBreak: 'break-all' }}>
+                        <strong>Signer:</strong> {v.keyid}
+                      </div>
+                    ) : null}
+                    {v.signedAt ? (
+                      <div>
+                        <strong>Signed at:</strong> {v.signedAt}
+                      </div>
+                    ) : null}
+                    {v.domain ? (
+                      <div>
+                        <strong>Domain:</strong> {v.domain}
+                      </div>
+                    ) : null}
+                    {Object.keys(v.claims).length > 0 ? (
+                      <div style={{ marginTop: 4 }}>
+                        <strong>Claims:</strong>
+                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
+                          {Object.entries(v.claims).map(([k, val]) => (
+                            <li key={k}>
+                              <em>{k}</em>: {val}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        <div className="verification-status" style={{ display: 'none' }}>
           <h2>Verification Status</h2>
           <p className={state.isVerified ? 'verified' : 'not-verified'}>
             {state.verificationStatus}
