@@ -29,9 +29,9 @@
   "permissions": [
     "storage",
     "tabs",
-    "notifications"
+    "notifications",
+    "scripting"
   ],
-  "_comment_host_permissions": "HTTP is included alongside HTTPS so the extension works against local development servers and the e2e simulation harness, which run plain-HTTP origins. Production HTMLTrust deployments are HTTPS by convention but the protocol does not require it; the verification logic itself is transport-agnostic.",
   "host_permissions": [
     "https://*/*",
     "http://*/*"
