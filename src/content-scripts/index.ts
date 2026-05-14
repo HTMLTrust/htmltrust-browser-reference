@@ -22,6 +22,7 @@
  */
 import {
   verifySignedSection,
+  extractSignedSections,
   evaluateTrustPolicy,
   defaultResolverChain,
   type VerifyResult,
@@ -258,6 +259,64 @@ async function autoVerifyPage(
 
   pageVerifications.length = 0;
 
+  // Fetch the original served HTML so we can verify against the pristine
+  // signed-section content rather than the live DOM. This sidesteps the
+  // runtime-DOM-mutation problem: any client-side script that adds, removes,
+  // or rewrites nodes inside a <signed-section> after page load (theme
+  // copy-button injection, syntax highlighters, lazy-loaders, share widgets)
+  // would otherwise make element.innerHTML disagree with what the signer
+  // hashed. Documented as "Known Issue: Runtime DOM Mutation" in the spec
+  // README.
+  //
+  // The DOM section is still used for UI placement (badge anchor, decoration)
+  // — only the bytes fed to verifySignedSection come from the pristine fetch.
+  //
+  // Pristine slices are position-paired with live DOM sections by document
+  // order. A page that re-orders signed-sections at runtime would defeat
+  // this pairing; that case is out of scope (would also defeat any
+  // signature-validity semantics).
+  //
+  // Fetch is cache-friendly: 'force-cache' lets the browser HTTP cache
+  // serve this near-instantaneously on the typical reload-after-load path.
+  // On the first load it's a duplicate of the navigation, which the HTTP
+  // cache catches per RFC 7234 when the origin sets reasonable cache headers.
+  let pristineSlices: string[] = [];
+  let pristineFetchError: string | null = null;
+  try {
+    const pageResp = await fetch(window.location.href, {
+      cache: 'force-cache',
+      credentials: 'same-origin',
+    });
+    if (!pageResp.ok) {
+      pristineFetchError = `pristine fetch HTTP ${pageResp.status}`;
+    } else {
+      const pageHTML = await pageResp.text();
+      pristineSlices = extractSignedSections(pageHTML);
+    }
+  } catch (err) {
+    pristineFetchError = err instanceof Error ? err.message : String(err);
+  }
+
+  // If the pristine fetch failed entirely OR returned a different count
+  // than the DOM (page re-rendered between navigation and our fetch, SPA
+  // route change, intercepting service worker), we fall back to per-section
+  // DOM-based verification. The runtime-mutation false-invalid risk
+  // re-applies, but it's better than no verification at all.
+  if (pristineFetchError || pristineSlices.length !== sections.length) {
+    if (pristineFetchError) {
+      console.warn('[htmltrust] pristine fetch failed; falling back to DOM verify:', pristineFetchError);
+    } else {
+      console.warn(
+        '[htmltrust] pristine fetch returned',
+        pristineSlices.length,
+        'sections but DOM has',
+        sections.length,
+        '— falling back to DOM verify',
+      );
+    }
+    pristineSlices = [];
+  }
+
   let i = 0;
   for (const section of Array.from(sections)) {
     // Idempotency: skip sections we've already decorated.
@@ -266,7 +325,13 @@ async function autoVerifyPage(
     }
 
     try {
-      const verify = await verifySignedSection(section, {
+      // Prefer the pristine HTML slice (immune to runtime DOM mutation);
+      // fall back to the live DOM element when pristine fetch failed or
+      // the counts didn't match.
+      const verifyInput: Element | string = pristineSlices.length
+        ? pristineSlices[i]
+        : section;
+      const verify = await verifySignedSection(verifyInput, {
         keyResolvers: resolverChain,
         domain,
         debug: true,
