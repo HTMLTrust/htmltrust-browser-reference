@@ -29,8 +29,8 @@ src/
 ├── platforms/            # 🔴 BROWSER-SPECIFIC — one adapter per browser
 │   ├── common/           # PlatformAdapter interface (storage, messaging, tabs, scripting)
 │   ├── chromium/         # Chrome / Edge implementation + Manifest V3
-│   ├── firefox/          # Future — Manifest V2 (manifest only, no adapter yet)
-│   └── safari/           # Future — Manifest V3 (manifest only, no adapter yet)
+│   ├── firefox/          # Future, Manifest V2 (manifest only, no adapter yet)
+│   └── safari/           # Future, Manifest V3 (manifest only, no adapter yet)
 ├── ui/                   # ✅ SHARED — React components for popup, options, and in-page UI
 │   ├── components/       # Reusable widgets (Button, MetadataInput, ProfileManager, etc.)
 │   ├── popup/            # Extension popup (verification status, signing controls)
@@ -70,15 +70,26 @@ workspace/
 └── htmltrust-browser-reference/
 ```
 
-The canonicalization package is downloaded from its pinned v0.2.2 release archive, so only the browser-client sibling is required.
+The canonicalization package is downloaded from its pinned v0.2.2 release archive. The browser-client sibling must be built before installing this package.
 
-### Build
+### Clean checkout
 
 ```sh
+mkdir htmltrust-workspace
+cd htmltrust-workspace
+git clone https://github.com/HTMLTrust/htmltrust-browser-client.git
 git clone https://github.com/HTMLTrust/htmltrust-browser-reference.git
-cd htmltrust-browser-reference
-npm ci
+cd htmltrust-browser-client
+git checkout 09e8c7552c8111a2cedd83fa45f4ffe3811bf5ca
+npm ci --ignore-scripts
+npm run build
+cd ../htmltrust-browser-reference
+npm ci --ignore-scripts
 ```
+
+The browser-client commit above is the revision pinned by the reference repository's CI. Keep the checkout at that revision when reproducing CI locally.
+
+### Build
 
 Build for a specific browser:
 
@@ -114,6 +125,16 @@ npm run typecheck        # TypeScript check without emitting files
 npm run lint             # Lint TypeScript sources
 ```
 
+The CI validation sequence runs `npm run lint`, `npm test`, and each browser build:
+
+```sh
+npm run lint
+npm test
+npm run build:chromium
+npm run build:firefox
+npm run build:safari
+```
+
 ## Project Structure
 
 ```
@@ -124,7 +145,7 @@ npm run lint             # Lint TypeScript sources
 ├── tsconfig.json
 ├── webpack.config.js
 ├── jest.config.js
-└── .eslintrc.js
+└── eslint.config.js
 ```
 
 ## Current Status
@@ -132,8 +153,8 @@ npm run lint             # Lint TypeScript sources
 - ✅ Chromium adapter fully implemented
 - ✅ Core content verification pipeline
 - ✅ React popup and options UI
-- ⬜ Firefox adapter (manifest only — needs `browser.*` API adapter)
-- ⬜ Safari adapter (manifest only — needs adapter)
+- ⬜ Firefox adapter, manifest only, needs a `browser.*` API adapter
+- ⬜ Safari adapter, manifest only, needs an adapter
 
 ## Companion Repositories
 
