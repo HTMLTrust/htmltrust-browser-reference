@@ -22,6 +22,8 @@ module.exports = [
       globals: {
         ...globals.browser,
         ...globals.node,
+        ...globals.jest,
+        chrome: "readonly",
       },
     },
     plugins: {
@@ -33,6 +35,8 @@ module.exports = [
       react: { version: "detect" },
     },
     rules: {
+      "no-undef": "off",
+      "no-unused-vars": "off",
       "@typescript-eslint/no-explicit-any": "warn",
       "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
       "react/prop-types": "off",
