@@ -48,7 +48,7 @@
   },
   "dependencies": {
     "@htmltrust/browser-client": "file:../htmltrust-browser-client",
-    "@htmltrust/canonicalization": "file:../htmltrust-canonicalization/javascript",
+    "@htmltrust/canonicalization": "https://github.com/HTMLTrust/htmltrust-canonicalization/archive/refs/tags/v0.2.2.tar.gz",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
     "js-sha256": "^0.11.0",

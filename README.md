@@ -59,20 +59,31 @@ src/
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 22+ and npm
+- Chromium, Firefox, or Safari for loading the matching build
+
+The extension consumes the browser-client package from a sibling checkout. Use this layout when developing the two repositories together:
+
+```
+workspace/
+├── htmltrust-browser-client/
+└── htmltrust-browser-reference/
+```
+
+The canonicalization package is downloaded from its pinned v0.2.2 release archive, so only the browser-client sibling is required.
 
 ### Build
 
 ```sh
 git clone https://github.com/HTMLTrust/htmltrust-browser-reference.git
 cd htmltrust-browser-reference
-npm install
+npm ci
 ```
 
 Build for a specific browser:
 
 ```sh
-npm run build:chrome     # → build/chromium/
+npm run build:chromium   # → build/chromium/
 npm run build:firefox    # → build/firefox/
 npm run build:safari     # → build/safari/
 ```
@@ -86,7 +97,7 @@ npm run build            # Builds all targets + creates zips
 ### Development
 
 ```sh
-npm run dev:chrome       # Watch mode for Chromium
+npm run dev:chromium     # Watch mode for Chromium
 ```
 
 ### Load in Chrome
@@ -99,7 +110,8 @@ npm run dev:chrome       # Watch mode for Chromium
 
 ```sh
 npm test                 # Run all tests
-npm run test:coverage    # With coverage report
+npm run typecheck        # TypeScript check without emitting files
+npm run lint             # Lint TypeScript sources
 ```
 
 ## Project Structure
