@@ -18,56 +18,60 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          path: htmltrust-browser-reference
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: HTMLTrust/htmltrust-browser-client
+          ref: 09e8c7552c8111a2cedd83fa45f4ffe3811bf5ca
+          persist-credentials: false
+          path: htmltrust-browser-client
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
-      # The package token used to be written to ~/.gitconfig, where every later
-      # step -- including any dependency lifecycle script -- could read it back.
-      # It is now passed through GIT_CONFIG_* environment variables, which git
-      # honours for this process tree only and never persists to disk, and
-      # --ignore-scripts keeps third-party install hooks from running at all
-      # while the token is in the environment. The webpack and eslint steps that
-      # follow run untrusted dependency code, but no longer with the token in
-      # reach.
-      #
-      # HTMLTRUST_PKG_TOKEN must be a fine-grained PAT scoped to the HTMLTrust
-      # package repositories with Contents: Read and nothing else. A classic
-      # `repo`-scoped token grants write access to every repo the owner can
-      # reach and must not be used here.
+      - name: Build browser client dependency
+        working-directory: htmltrust-browser-client
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+
       - name: Install dependencies
-        env:
-          GIT_CONFIG_COUNT: "2"
-          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/.insteadOf
-          GIT_CONFIG_VALUE_0: https://github.com/
-          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/.insteadOf
-          GIT_CONFIG_VALUE_1: ssh://git@github.com/
+        working-directory: htmltrust-browser-reference
         run: npm ci --ignore-scripts
 
       - name: Lint
-        run: npx eslint src/ --ext .ts,.tsx || true
+        working-directory: htmltrust-browser-reference
+        run: npm run lint
+
+      - name: Run tests
+        working-directory: htmltrust-browser-reference
+        run: npm test
 
       - name: Build Chromium
-        run: npx webpack --mode=production --env target=chromium
+        working-directory: htmltrust-browser-reference
+        run: npm run build:chromium
 
       - name: Build Firefox
-        run: npx webpack --mode=production --env target=firefox
+        working-directory: htmltrust-browser-reference
+        run: npm run build:firefox
 
       - name: Build Safari
-        run: npx webpack --mode=production --env target=safari
+        working-directory: htmltrust-browser-reference
+        run: npm run build:safari
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: extension-chromium
-          path: build/chromium/
+          path: htmltrust-browser-reference/build/chromium/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: extension-firefox
-          path: build/firefox/
+          path: htmltrust-browser-reference/build/firefox/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: extension-safari
-          path: build/safari/
+          path: htmltrust-browser-reference/build/safari/
