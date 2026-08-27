@@ -38,6 +38,7 @@ import {
   TrustStatus,
   VoteType,
   Settings,
+  VerificationInputState,
   getTrustDirectoryUrls,
 } from '../core/common/types';
 
@@ -61,7 +62,13 @@ const AUTO_BADGE_MARKER = 'cs-auto-verification-badges';
  */
 type PageVerification = {
   index: number;
+  /** True only when the currently rendered DOM is verified. */
   valid: boolean;
+  /** True when the verifier found a valid cryptographic source input. */
+  cryptoValid: boolean;
+  inputState: VerificationInputState;
+  sourceVerified: boolean;
+  renderedVerified: boolean;
   reason: string | null;
   trustScore: number;
   trustIndicator: 'green' | 'yellow' | 'red';
@@ -71,6 +78,15 @@ type PageVerification = {
   signedAt: string;
   domain: string;
   claims: Record<string, string>;
+};
+
+type SectionVerificationRun = {
+  verify: VerifyResult;
+  inputState: VerificationInputState;
+  sourceVerified: boolean;
+  renderedVerified: boolean;
+  displayValid: boolean;
+  reason: string | null;
 };
 
 /** Module-scoped cache of this page's verification results. */
@@ -115,7 +131,10 @@ async function initialize() {
     // 1. Settings → resolver chain + trust policy inputs
     currentSettings = await loadSettings();
     const directories = getTrustDirectoryUrls(currentSettings);
-    currentResolverChain = defaultResolverChain({ directories });
+    currentResolverChain = defaultResolverChain({
+      directories,
+      fetch: createVerifierFetch(),
+    });
 
     // 2. Auto-verify on page load. Idempotent: re-running is a no-op for
     //    sections that already have an auto badge container next to them.
@@ -176,7 +195,7 @@ function redecoratePage(): void {
     // applier. The cache is intentionally a flat snapshot; the original
     // objects don't survive across the listener boundary.
     const verifyShape: VerifyResult = {
-      valid: cached.valid,
+      valid: cached.cryptoValid,
       keyid: cached.keyid,
       algorithm: cached.algorithm,
       contentHash: '',
@@ -184,14 +203,24 @@ function redecoratePage(): void {
       claims: cached.claims,
       signedAt: cached.signedAt,
       domain: cached.domain,
-      reason: cached.reason ?? undefined,
+      origin: cached.domain,
+      inputState: cached.inputState as VerifyResult['inputState'],
+      reason: cached.reason as VerifyResult['reason'],
     };
     const trustShape: TrustEvaluation = {
       score: cached.trustScore,
       indicator: cached.trustIndicator,
       inputs: [],
     };
-    applySectionStatusUI(list[i], verifyShape, trustShape, cached.reason, currentSettings);
+    const runShape: SectionVerificationRun = {
+      verify: verifyShape,
+      inputState: cached.inputState,
+      sourceVerified: cached.sourceVerified,
+      renderedVerified: cached.renderedVerified,
+      displayValid: cached.valid,
+      reason: cached.reason,
+    };
+    applySectionStatusUI(list[i], runShape, trustShape, cached.reason, currentSettings);
   }
 }
 
@@ -222,6 +251,148 @@ async function loadSettings(): Promise<Settings> {
     trustedDomains: [],
     authMethod: 'apikey',
     serverConfigs: [],
+    developerDebugLogging: false,
+  };
+}
+
+function currentOrigin(): string {
+  return window.location.origin;
+}
+
+function redactForLog(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value.length > 80) return `${value.slice(0, 24)}...[redacted:${value.length}]`;
+    if (/signature|BEGIN PUBLIC KEY|PRIVATE KEY|sha256:/i.test(value)) return '[redacted]';
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(redactForLog);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, val]) => [
+        key,
+        /content|signature|key|hash|html|pem/i.test(key) ? '[redacted]' : redactForLog(val),
+      ]),
+    );
+  }
+  return value;
+}
+
+function debugLog(settings: Settings, message: string, details?: unknown): void {
+  if (!settings.developerDebugLogging) return;
+  if (details === undefined) {
+    console.debug(`[htmltrust] ${message}`);
+  } else {
+    console.debug(`[htmltrust] ${message}`, redactForLog(details));
+  }
+}
+
+function createVerifierFetch(): typeof fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.protocol !== 'https:') {
+      throw new Error('network-policy-blocked: verifier key and directory fetches require HTTPS');
+    }
+    return fetch(input, {
+      ...init,
+      credentials: 'omit',
+      referrer: '',
+      referrerPolicy: 'no-referrer',
+      redirect: 'error',
+    });
+  };
+}
+
+async function fetchPristineSignedSections(settings: Settings): Promise<{
+  slices: string[];
+  error: string | null;
+}> {
+  const pageUrl = new URL(window.location.href);
+  if (pageUrl.protocol !== 'https:') {
+    return {
+      slices: [],
+      error: 'network-policy-blocked: source refetch requires HTTPS',
+    };
+  }
+
+  try {
+    const pageResp = await fetch(window.location.href, {
+      cache: 'force-cache',
+      credentials: 'same-origin',
+      referrer: '',
+      referrerPolicy: 'no-referrer',
+      redirect: 'error',
+    });
+    if (!pageResp.ok) {
+      return { slices: [], error: `source-refetch-failed: HTTP ${pageResp.status}` };
+    }
+    if (new URL(pageResp.url).origin !== currentOrigin()) {
+      return { slices: [], error: 'network-policy-blocked: source refetch changed origin' };
+    }
+    const pageHTML = await pageResp.text();
+    return { slices: extractSignedSections(pageHTML), error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    debugLog(settings, 'source refetch failed', { reason: message });
+    return { slices: [], error: `source-refetch-failed: ${message}` };
+  }
+}
+
+async function verifySectionWithState(
+  section: Element,
+  sourceSlice: string | null,
+  resolverChain: KeyResolver[],
+  settings: Settings,
+): Promise<SectionVerificationRun> {
+  const origin = currentOrigin();
+  const options = {
+    keyResolvers: resolverChain,
+    domain: origin,
+    origin,
+    baseUrl: window.location.href,
+    debug: settings.developerDebugLogging === true,
+  };
+
+  if (!sourceSlice) {
+    const verify = await verifySignedSection(section, options);
+    const inputState = verify.inputState as VerificationInputState;
+    return {
+      verify,
+      inputState,
+      sourceVerified: false,
+      renderedVerified: verify.valid && inputState === 'rendered-match',
+      displayValid: verify.valid && inputState === 'rendered-match',
+      reason: verify.valid ? null : verify.reason ?? 'unknown',
+    };
+  }
+
+  const sourceVerify = await verifySignedSection(sourceSlice, {
+    ...options,
+    renderedSection: section,
+  });
+  const inputState = sourceVerify.inputState as VerificationInputState;
+  if (!sourceVerify.valid) {
+    return {
+      verify: sourceVerify,
+      inputState,
+      sourceVerified: false,
+      renderedVerified: false,
+      displayValid: false,
+      reason: sourceVerify.reason ?? 'source verification failed',
+    };
+  }
+
+  return {
+    verify: sourceVerify,
+    inputState,
+    sourceVerified: true,
+    renderedVerified: inputState === 'rendered-match',
+    displayValid: inputState === 'rendered-match',
+    reason:
+      inputState === 'rendered-match'
+        ? null
+        : inputState === 'stale'
+        ? 'rendered DOM diverged from verified source'
+        : 'rendered DOM not compared',
   };
 }
 
@@ -253,7 +424,6 @@ async function autoVerifyPage(
     return;
   }
 
-  const domain = window.location.hostname;
   const personalTrustList = settings.personalTrustList ?? [];
   const trustedDomains = settings.trustedDomains ?? [];
 
@@ -280,22 +450,9 @@ async function autoVerifyPage(
   // serve this near-instantaneously on the typical reload-after-load path.
   // On the first load it's a duplicate of the navigation, which the HTTP
   // cache catches per RFC 7234 when the origin sets reasonable cache headers.
-  let pristineSlices: string[] = [];
-  let pristineFetchError: string | null = null;
-  try {
-    const pageResp = await fetch(window.location.href, {
-      cache: 'force-cache',
-      credentials: 'same-origin',
-    });
-    if (!pageResp.ok) {
-      pristineFetchError = `pristine fetch HTTP ${pageResp.status}`;
-    } else {
-      const pageHTML = await pageResp.text();
-      pristineSlices = extractSignedSections(pageHTML);
-    }
-  } catch (err) {
-    pristineFetchError = err instanceof Error ? err.message : String(err);
-  }
+  const { slices: fetchedPristineSlices, error: pristineFetchError } =
+    await fetchPristineSignedSections(settings);
+  let pristineSlices = fetchedPristineSlices;
 
   // If the pristine fetch failed entirely OR returned a different count
   // than the DOM (page re-rendered between navigation and our fetch, SPA
@@ -303,17 +460,11 @@ async function autoVerifyPage(
   // DOM-based verification. The runtime-mutation false-invalid risk
   // re-applies, but it's better than no verification at all.
   if (pristineFetchError || pristineSlices.length !== sections.length) {
-    if (pristineFetchError) {
-      console.warn('[htmltrust] pristine fetch failed; falling back to DOM verify:', pristineFetchError);
-    } else {
-      console.warn(
-        '[htmltrust] pristine fetch returned',
-        pristineSlices.length,
-        'sections but DOM has',
-        sections.length,
-        '— falling back to DOM verify',
-      );
-    }
+    debugLog(settings, 'source snapshot unavailable; falling back to rendered DOM verification', {
+      reason: pristineFetchError,
+      sourceSections: pristineSlices.length,
+      renderedSections: sections.length,
+    });
     pristineSlices = [];
   }
 
@@ -325,17 +476,13 @@ async function autoVerifyPage(
     }
 
     try {
-      // Prefer the pristine HTML slice (immune to runtime DOM mutation);
-      // fall back to the live DOM element when pristine fetch failed or
-      // the counts didn't match.
-      const verifyInput: Element | string = pristineSlices.length
-        ? pristineSlices[i]
-        : section;
-      const verify = await verifySignedSection(verifyInput, {
-        keyResolvers: resolverChain,
-        domain,
-        debug: true,
-      });
+      const run = await verifySectionWithState(
+        section,
+        pristineSlices.length ? pristineSlices[i] : null,
+        resolverChain,
+        settings,
+      );
+      const verify = run.verify;
 
       // Layer 2: trust policy. directorySubscriptions is intentionally empty
       // here — the spec-compliant `<dir>/keys/<keyid>/reputation` endpoint
@@ -351,11 +498,15 @@ async function autoVerifyPage(
         directorySubscriptions: [],
       });
 
-      applySectionStatusUI(section, verify, trust, null, settings);
+      applySectionStatusUI(section, run, trust, null, settings);
       pageVerifications.push({
         index: i,
-        valid: verify.valid,
-        reason: verify.valid ? null : verify.reason ?? 'unknown',
+        valid: run.displayValid,
+        cryptoValid: verify.valid,
+        inputState: run.inputState,
+        sourceVerified: run.sourceVerified,
+        renderedVerified: run.renderedVerified,
+        reason: run.reason,
         trustScore: trust.score,
         trustIndicator: trust.indicator,
         trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
@@ -366,19 +517,25 @@ async function autoVerifyPage(
         claims: verify.claims ?? {},
       });
     } catch (err) {
-      console.error('Content Signing: verification failed for a signed-section', err);
-      applySectionStatusUI(section, null, null, (err as Error).message ?? 'verification error', settings);
+      const reason = (err as Error).message ?? 'verification error';
+      console.error('Content Signing: verification failed for a signed-section');
+      debugLog(settings, 'signed-section verification exception', { reason });
+      applySectionStatusUI(section, null, null, reason, settings);
       pageVerifications.push({
         index: i,
         valid: false,
-        reason: (err as Error).message ?? 'verification error',
+        cryptoValid: false,
+        inputState: 'source-only',
+        sourceVerified: false,
+        renderedVerified: false,
+        reason,
         trustScore: 0,
         trustIndicator: 'red',
         trustLabel: 'Untrusted',
         keyid: '',
         algorithm: '',
         signedAt: '',
-        domain,
+        domain: currentOrigin(),
         claims: {},
       });
     }
@@ -404,7 +561,7 @@ const SECTION_DECORATED_CLASS = 'cs-decorated';
  */
 function applySectionStatusUI(
   section: Element,
-  verify: VerifyResult | null,
+  run: SectionVerificationRun | null,
   trust: TrustEvaluation | null,
   errorReason: string | null,
   settings: Settings,
@@ -416,28 +573,45 @@ function applySectionStatusUI(
   // Master kill switch.
   if (!settings.showBadges) return;
 
-  const valid = verify?.valid === true;
+  const verify = run?.verify ?? null;
+  const valid = run?.displayValid === true;
+  const stale = run?.inputState === 'stale';
   if (valid && settings.highlightVerified) {
     section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.VERIFIED_CONTENT);
+  } else if (stale && settings.highlightVerified) {
+    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.UNKNOWN_CONTENT);
   } else if (!valid && settings.highlightUnverified) {
     section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.UNVERIFIED_CONTENT);
   }
 
-  // Tooltip carries the human-readable status — popup is the rich surface.
-  const reason = errorReason ?? verify?.reason ?? null;
+  // Tooltip carries a short warning only. The extension popup is the
+  // authoritative, less-spoofable surface for details.
+  const reason = errorReason ?? run?.reason ?? verify?.reason ?? null;
   const trustPart = trust ? ` · Trust: ${trust.score}% (${trust.indicator})` : '';
-  const tooltip = valid
-    ? `HTMLTrust: ✓ Signature valid${trustPart}`
-    : `HTMLTrust: ✗ Signature invalid${reason ? ` (${reason})` : ''}`;
+  const statePart =
+    run?.inputState === 'stale'
+      ? 'Source signature valid; rendered DOM differs'
+      : run?.inputState === 'source-only' && verify?.valid
+      ? 'Source signature valid; rendered DOM not compared'
+      : valid
+      ? 'Rendered content verified'
+      : 'Signature invalid';
+  const tooltip = `HTMLTrust page marker only; open the extension popup for authoritative details. ${statePart}${trustPart}${
+    reason ? ` (${reason})` : ''
+  }`;
   (section as HTMLElement).title = tooltip;
 
   const badges = document.createElement('div');
   badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
   const sig = document.createElement('span');
   sig.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VALIDITY_BADGE} ${
-    valid ? CSS_CLASSES.VERIFICATION_BADGE_VERIFIED : CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED
+    valid
+      ? CSS_CLASSES.VERIFICATION_BADGE_VERIFIED
+      : stale || verify?.valid
+      ? CSS_CLASSES.VERIFICATION_BADGE_WARNING
+      : CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED
   }`;
-  sig.textContent = valid ? '✓' : '✗';
+  sig.textContent = valid ? '✓' : stale || verify?.valid ? '!' : '✗';
   sig.title = tooltip;
   badges.appendChild(sig);
   section.appendChild(badges);
@@ -466,7 +640,7 @@ function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElem
   const sigBadge = document.createElement('span');
   if (verify.valid) {
     sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-    sigBadge.textContent = '✓ Signature valid';
+    sigBadge.textContent = 'Rendered content verified';
     sigBadge.style.cssText =
       'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
   } else {
@@ -497,6 +671,8 @@ function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElem
     trustBadge.style.cssText =
       'background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px;';
   }
+  sigBadge.title = 'Page marker only; open the extension popup for authoritative verification details.';
+
   // Hover tooltip: per-input rationale, useful for debugging / auditability.
   trustBadge.title = trust.inputs
     .map((r: TrustInput) => `${r.source}: ${r.contribution} (${r.rationale})`)
@@ -868,7 +1044,7 @@ function listenForMessages() {
           // the array immutable from the caller's perspective.
           return {
             url: window.location.href,
-            domain: window.location.hostname,
+            domain: currentOrigin(),
             results: pageVerifications.slice(),
           };
         case MESSAGE_TYPES.VOTE_ACKNOWLEDGED:

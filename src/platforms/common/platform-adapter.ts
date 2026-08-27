@@ -74,12 +74,35 @@ export interface PlatformAdapter {
   closeTab(tabId: string): Promise<void>;
 
   /**
-   * Execute a script in a tab
+   * Execute a fixed script body in a tab.
+   *
+   * The body is a compile-time constant. Never build it by interpolating
+   * runtime values — that is code injection into the page. Use
+   * executeFunction() whenever the injected code needs runtime data.
+   *
    * @param tabId The ID of the tab to execute the script in
    * @param script The script to execute
    * @returns A promise that resolves with the result of the script
    */
   executeScript<T = any>(tabId: string, script: string): Promise<T>;
+
+  /**
+   * Execute a function in a tab, passing runtime data as arguments.
+   *
+   * The function is injected by reference and `args` crosses the boundary as
+   * structured-cloned data, so argument values are never parsed as code. This
+   * is the only safe way to inject anything derived from a network response.
+   *
+   * @param tabId The ID of the tab to execute the function in
+   * @param func The function to execute in the page
+   * @param args Structured-cloneable arguments passed to `func`
+   * @returns A promise that resolves with the return value of `func`
+   */
+  executeFunction<Args extends unknown[], R>(
+    tabId: string,
+    func: (...args: Args) => R,
+    args: Args,
+  ): Promise<R>;
 
   /**
    * Insert CSS into a tab

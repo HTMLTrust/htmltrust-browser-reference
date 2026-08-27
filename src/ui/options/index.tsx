@@ -413,10 +413,11 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
                 checked={state.settings.showBadges}
                 onChange={(e) => handleSettingChange('showBadges', e.target.checked)}
               />
-              Show verification badges
+              Show secondary on-page markers
             </label>
             <p className="option-description">
-              Show badges next to verified content
+              Show page-DOM markers next to signed content. Treat the popup
+              as the authoritative verification surface.
             </p>
           </div>
           
@@ -445,6 +446,21 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
             </label>
             <p className="option-description">
               Apply a highlight style to unverified content
+            </p>
+          </div>
+
+          <div className="option">
+            <label>
+              <input
+                type="checkbox"
+                checked={state.settings.developerDebugLogging === true}
+                onChange={(e) => handleSettingChange('developerDebugLogging', e.target.checked)}
+              />
+              Developer verifier diagnostics
+            </label>
+            <p className="option-description">
+              Enable verbose verifier diagnostics. Leave off unless debugging;
+              verifier diagnostics can expose content snippets or key material.
             </p>
           </div>
         </div>
@@ -515,7 +531,7 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
 
           <div className="option">
             <label htmlFor="trustedDomains">
-              Trusted Domains
+              Trusted Origins
             </label>
             <textarea
               id="trustedDomains"
@@ -527,13 +543,14 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
                   .filter((s) => s.length > 0);
                 handleSettingChange('trustedDomains', list);
               }}
-              placeholder={'nytimes.com\npropublica.org'}
+              placeholder={'https://www.nytimes.com\nhttps://www.propublica.org'}
               rows={4}
               style={{ width: '100%', fontFamily: 'monospace' }}
             />
             <p className="option-description">
-              One domain per line. Verified content whose signature binds to
-              one of these domains receives a +30 boost (spec §3.1, option B).
+              One serialized Web origin per line. Verified content whose
+              signature binds to one of these origins receives a +30 boost
+              (spec §3.1, option B).
             </p>
           </div>
         </div>

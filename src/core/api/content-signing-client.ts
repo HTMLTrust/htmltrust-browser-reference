@@ -6,7 +6,7 @@
  *   1. Local cryptographic verification of signed-section content. This is
  *      the spec-aligned (§3.1) path: the extension verifies signatures
  *      itself via @htmltrust/browser-client, which uses SubtleCrypto and a
- *      pluggable resolver chain (did:web → direct URL → trust directories)
+ *      pluggable resolver chain (did:web -> direct URL -> trust directories)
  *      to fetch keys. NO trust server is contacted for verification.
  *
  *   2. Author/key/content management operations against a trust server.
@@ -26,12 +26,40 @@ import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import {
   verifySignedSection,
   defaultResolverChain,
+  isPrivateHost,
   type VerifyResult,
 } from '@htmltrust/browser-client';
 import type { KeyResolver } from '@htmltrust/browser-client';
 import { Author, PublicKey, ContentSignature, Claim, KeyReputation, ContentOccurrence, ServerConfig, VoteType, BatchedVotesPayload, BatchVoteResult } from '../common/types';
 import { ERROR_CODES, API_ENDPOINTS } from '../common/constants';
 import { createError } from '../common/utils';
+
+function defaultSerializedOrigin(): string | undefined {
+  const locationLike = globalThis.location as Location | undefined;
+  return locationLike?.origin;
+}
+
+function createVerifierFetch(): typeof fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.protocol !== 'https:') {
+      throw new Error('network-policy-blocked: verifier key and directory fetches require HTTPS');
+    }
+    // An extension's fetch is not bound by page CORS, so a keyid pointing at
+    // loopback, link-local, or RFC 1918 space would reach hosts the page never
+    // could. Refuse those outright.
+    if (isPrivateHost(url.hostname)) {
+      throw new Error('network-policy-blocked: verifier fetches may not target private hosts');
+    }
+    return fetch(input, {
+      ...init,
+      credentials: 'omit',
+      referrer: '',
+      referrerPolicy: 'no-referrer',
+      redirect: 'error',
+    });
+  };
+}
 
 /**
  * Content Signing API client options
@@ -56,7 +84,7 @@ export interface ContentSigningClientOptions {
 export interface LocalVerifyOptions {
   /** The signed-section element or its outerHTML. */
   section: Element | string;
-  /** Domain to bind the signature to. Defaults to window.location.hostname. */
+  /** Serialized Web origin to bind the signature to. Defaults to window.location.origin. */
   domain?: string;
   /** Optional override of the resolver chain (overrides client-configured directories). */
   keyResolvers?: KeyResolver[];
@@ -76,6 +104,7 @@ export class ContentSigningClient {
   private baseUrl: string;
   private trustDirectories: string[];
   private resolverChain: KeyResolver[];
+  private verifierFetch: typeof fetch;
 
   /**
    * Create a new Content Signing API client
@@ -84,10 +113,14 @@ export class ContentSigningClient {
   constructor(options: ContentSigningClientOptions) {
     this.baseUrl = options.baseUrl;
     this.trustDirectories = options.trustDirectories ?? [];
+    this.verifierFetch = createVerifierFetch();
     // Build the resolver chain once. did:web and directUrl are always present;
     // trust directories are appended only when configured (they're a network
     // lookup of last resort).
-    this.resolverChain = defaultResolverChain({ directories: this.trustDirectories });
+    this.resolverChain = defaultResolverChain({
+      directories: this.trustDirectories,
+      fetch: this.verifierFetch,
+    });
 
     const config: AxiosRequestConfig = {
       baseURL: options.baseUrl,
@@ -106,7 +139,10 @@ export class ContentSigningClient {
    */
   setTrustDirectories(directories: string[]): void {
     this.trustDirectories = directories;
-    this.resolverChain = defaultResolverChain({ directories });
+    this.resolverChain = defaultResolverChain({
+      directories,
+      fetch: this.verifierFetch,
+    });
   }
 
   /** Get the configured resolver chain (for callers that want to reuse it). */
@@ -153,7 +189,7 @@ export class ContentSigningClient {
   async verifySignedSectionLocal(opts: LocalVerifyOptions): Promise<VerifyResult> {
     return verifySignedSection(opts.section, {
       keyResolvers: opts.keyResolvers ?? this.resolverChain,
-      domain: opts.domain,
+      domain: opts.domain ?? defaultSerializedOrigin(),
       hash: opts.hash,
     });
   }

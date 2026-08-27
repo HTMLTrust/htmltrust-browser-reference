@@ -201,6 +201,12 @@ export interface TrustDirectoryEntry {
 export type TrustStatus = 'trusted' | 'untrusted' | 'unknown';
 
 /**
+ * How the verified input relates to the currently rendered page.
+ * Mirrors the provisional browser-client contract in the HTMLTrust specs.
+ */
+export type VerificationInputState = 'source-only' | 'stale' | 'rendered-match';
+
+/**
  * Represents the result of a content verification
  */
 export interface VerificationResult {
@@ -263,8 +269,9 @@ export interface Settings {
    */
   personalTrustList?: string[];
   /**
-   * Domains the user explicitly trusts. Empty by default; matching domains
-   * contribute +30 to the policy score per spec §3.1.
+   * Serialized Web origins the user explicitly trusts. Empty by default;
+   * matching origins contribute +30 to the policy score per spec §3.1.
+   * The field name is legacy and retained for persisted settings.
    */
   trustedDomains?: string[];
   /** The user's preferred authentication method */
@@ -273,6 +280,11 @@ export interface Settings {
   serverConfigs: ServerConfig[];
   /** ID of the active server configuration */
   activeServerId?: string;
+  /**
+   * Enables verbose verifier diagnostics for developers. Off by default
+   * because verifier debug output can include content snippets and key data.
+   */
+  developerDebugLogging?: boolean;
 }
 
 /**

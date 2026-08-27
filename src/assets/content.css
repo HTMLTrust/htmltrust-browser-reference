@@ -66,6 +66,12 @@
   background-color: #F44336;
 }
 
+/* Warning badge */
+.cs-verification-badge-warning {
+  background-color: #FFC107;
+  color: #333;
+}
+
 /* Trust badges */
 .cs-trust-badge {
   color: white;
