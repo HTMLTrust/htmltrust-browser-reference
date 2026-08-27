@@ -37,27 +37,8 @@ jobs:
           npm ci --ignore-scripts
           npm run build
 
-      # The package token used to be written to ~/.gitconfig, where every later
-      # step -- including any dependency lifecycle script -- could read it back.
-      # It is now passed through GIT_CONFIG_* environment variables, which git
-      # honours for this process tree only and never persists to disk, and
-      # --ignore-scripts keeps third-party install hooks from running at all
-      # while the token is in the environment. The webpack and eslint steps that
-      # follow run untrusted dependency code, but no longer with the token in
-      # reach.
-      #
-      # HTMLTRUST_PKG_TOKEN must be a fine-grained PAT scoped to the HTMLTrust
-      # package repositories with Contents: Read and nothing else. A classic
-      # `repo`-scoped token grants write access to every repo the owner can
-      # reach and must not be used here.
       - name: Install dependencies
         working-directory: htmltrust-browser-reference
-        env:
-          GIT_CONFIG_COUNT: "2"
-          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/.insteadOf
-          GIT_CONFIG_VALUE_0: https://github.com/
-          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.HTMLTRUST_PKG_TOKEN }}@github.com/.insteadOf
-          GIT_CONFIG_VALUE_1: ssh://git@github.com/
         run: npm ci --ignore-scripts
 
       - name: Lint
