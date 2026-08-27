@@ -22,6 +22,7 @@ export const EXTENSION_VERSION = '1.0.0';
  *
  * personalTrustList and trustedDomains start empty; the user populates them
  * via the options page. They feed the lib's evaluateTrustPolicy directly.
+ * trustedDomains stores serialized Web origins despite the legacy field name.
  */
 export const DEFAULT_SETTINGS = {
   autoVerify: true,
@@ -41,7 +42,8 @@ export const DEFAULT_SETTINGS = {
       isActive: true
     }
   ],
-  activeServerId: 'default'
+  activeServerId: 'default',
+  developerDebugLogging: false,
 };
 
 /**
@@ -116,6 +118,7 @@ export const CSS_CLASSES = {
   VALIDITY_BADGE: 'cs-validity-badge',
   VERIFICATION_BADGE_VERIFIED: 'cs-verification-badge-verified',
   VERIFICATION_BADGE_UNVERIFIED: 'cs-verification-badge-unverified',
+  VERIFICATION_BADGE_WARNING: 'cs-verification-badge-warning',
   TRUST_BADGE: 'cs-trust-badge',
   TRUST_BADGE_TRUSTED: 'cs-trust-badge-trusted',
   TRUST_BADGE_UNTRUSTED: 'cs-trust-badge-untrusted',

@@ -43,6 +43,7 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
       });
       expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
         directories,
+        fetch: expect.any(Function),
       });
     });
 
@@ -50,6 +51,7 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
       new ContentSigningClient({ baseUrl: 'https://api.example/' });
       expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
         directories: [],
+        fetch: expect.any(Function),
       });
     });
   });
@@ -69,7 +71,7 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
       const section = '<signed-section signature="sig"></signed-section>';
       const result = await client.verifySignedSectionLocal({
         section,
-        domain: 'example.test',
+        domain: 'https://example.test',
       });
 
       expect(result).toBe(fakeResult);
@@ -77,7 +79,7 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
       const [arg0, arg1] = (browserClient.verifySignedSection as jest.Mock).mock
         .calls[0];
       expect(arg0).toBe(section);
-      expect(arg1.domain).toBe('example.test');
+      expect(arg1.domain).toBe('https://example.test');
       // The resolver chain must be the one the constructor built.
       expect(arg1.keyResolvers).toEqual(client.getResolverChain());
     });
@@ -142,6 +144,7 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
 
       expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
         directories: next,
+        fetch: expect.any(Function),
       });
     });
   });

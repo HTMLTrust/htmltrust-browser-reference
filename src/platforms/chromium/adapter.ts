@@ -275,7 +275,11 @@ export class ChromiumAdapter implements PlatformAdapter {
   }
 
   /**
-   * Execute a script in a tab
+   * Execute a fixed script body in a tab.
+   *
+   * `script` is compiled with `new Function`, so it must be a compile-time
+   * constant. Anything carrying runtime data belongs in executeFunction().
+   *
    * @param tabId The ID of the tab to execute the script in
    * @param script The script to execute
    * @returns A promise that resolves with the result of the script
@@ -292,6 +296,39 @@ export class ChromiumAdapter implements PlatformAdapter {
           reject(new Error('Script execution failed'));
         } else {
           resolve(results[0].result as T);
+        }
+      });
+    });
+  }
+
+  /**
+   * Execute a function in a tab with structured-cloned arguments.
+   *
+   * `args` is transferred as data by chrome.scripting, so values taken from a
+   * network response cannot escape into the injected code.
+   *
+   * @param tabId The ID of the tab to execute the function in
+   * @param func The function to execute in the page
+   * @param args Structured-cloneable arguments passed to `func`
+   * @returns A promise that resolves with the return value of `func`
+   */
+  async executeFunction<Args extends unknown[], R>(
+    tabId: string,
+    func: (...args: Args) => R,
+    args: Args,
+  ): Promise<R> {
+    return new Promise((resolve, reject) => {
+      chrome.scripting.executeScript({
+        target: { tabId: parseInt(tabId, 10) },
+        func: func as (...injected: any[]) => any,
+        args: args as any[],
+      }, (results) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (!results || results.length === 0) {
+          reject(new Error('Script execution failed'));
+        } else {
+          resolve(results[0].result as R);
         }
       });
     });

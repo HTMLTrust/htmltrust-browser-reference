@@ -24,7 +24,12 @@ const platformAdapter: PlatformAdapter = new ChromiumAdapter();
  */
 interface PageVerification {
   index: number;
+  /** True only when the currently rendered DOM is verified. */
   valid: boolean;
+  cryptoValid: boolean;
+  inputState: 'source-only' | 'stale' | 'rendered-match';
+  sourceVerified: boolean;
+  renderedVerified: boolean;
   reason: string | null;
   trustScore: number;
   trustIndicator: 'green' | 'yellow' | 'red';
@@ -413,7 +418,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
             Show on-page badges
           </label>
           <p style={{ margin: '2px 0 0 22px', fontSize: 11, opacity: 0.7 }}>
-            Reload the page after toggling to apply.
+            Page markers are secondary; this popup is authoritative.
           </p>
         </div>
 
@@ -426,10 +431,26 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           ) : (
             <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
               {state.pageVerifications.map((v) => {
-                const bg = v.valid
+                const renderedMatch = v.inputState === 'rendered-match' && v.renderedVerified;
+                const sourceOnly = v.cryptoValid && v.inputState === 'source-only';
+                const stale = v.cryptoValid && v.inputState === 'stale';
+                const bg = renderedMatch
                   ? '#d4edda'
+                  : sourceOnly || stale
+                  ? '#fff3cd'
                   : '#f8d7da';
-                const fg = v.valid ? '#155724' : '#721c24';
+                const fg = renderedMatch
+                  ? '#155724'
+                  : sourceOnly || stale
+                  ? '#856404'
+                  : '#721c24';
+                const statusText = renderedMatch
+                  ? 'Rendered content verified'
+                  : stale
+                  ? 'Source verified; rendered content changed'
+                  : sourceOnly
+                  ? 'Source verified; rendered content not compared'
+                  : `Signature invalid${v.reason ? ` (${v.reason})` : ''}`;
                 const trustBg =
                   v.trustIndicator === 'green' ? '#d4edda'
                   : v.trustIndicator === 'red' ? '#f8d7da'
@@ -451,11 +472,15 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
                   >
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
                       <span style={{ background: bg, color: fg, padding: '2px 8px', borderRadius: 4 }}>
-                        {v.valid ? '✓ Signature valid' : `✗ Signature invalid${v.reason ? ` (${v.reason})` : ''}`}
+                        {statusText}
                       </span>
                       <span style={{ background: trustBg, color: trustFg, padding: '2px 8px', borderRadius: 4 }}>
                         Trust {v.trustScore}% · {v.trustLabel}
                       </span>
+                    </div>
+                    <div>
+                      <strong>Input:</strong> {v.inputState}
+                      {v.reason && v.cryptoValid ? ` (${v.reason})` : ''}
                     </div>
                     {v.keyid ? (
                       <div style={{ wordBreak: 'break-all' }}>
@@ -469,7 +494,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
                     ) : null}
                     {v.domain ? (
                       <div>
-                        <strong>Domain:</strong> {v.domain}
+                        <strong>Origin:</strong> {v.domain}
                       </div>
                     ) : null}
                     {Object.keys(v.claims).length > 0 ? (

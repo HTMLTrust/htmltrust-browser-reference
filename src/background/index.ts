@@ -4,6 +4,7 @@
 import {
   verifySignedSection,
   defaultResolverChain,
+  isPrivateHost,
 } from "@htmltrust/browser-client";
 import {
   Settings,
@@ -14,6 +15,11 @@ import {
   BatchedVotesPayload,
   BatchVoteResult,
   getTrustDirectoryUrls,
+  buildKeyidUrl,
+  requireCanonicalBase64,
+  requireContentHash,
+  requireTimestamp,
+  sanitizeClaims,
 } from "../core/common";
 import {
   STORAGE_KEYS,
@@ -41,6 +47,32 @@ const authService = new AuthService({
 let contentProcessor: ContentProcessor;
 let settings: Settings = DEFAULT_SETTINGS;
 let contentSigningClient: ContentSigningClient | null = null;
+
+function serializedOrigin(url: string): string {
+  return new URL(url).origin;
+}
+
+function createVerifierFetch(): typeof fetch {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.protocol !== "https:") {
+      throw new Error("network-policy-blocked: verifier key and directory fetches require HTTPS");
+    }
+    // An extension's fetch is not bound by page CORS, so a keyid pointing at
+    // loopback, link-local, or RFC 1918 space would reach hosts the page never
+    // could. Refuse those outright.
+    if (isPrivateHost(url.hostname)) {
+      throw new Error("network-policy-blocked: verifier fetches may not target private hosts");
+    }
+    return fetch(input, {
+      ...init,
+      credentials: "omit",
+      referrer: "",
+      referrerPolicy: "no-referrer",
+      redirect: "error",
+    });
+  };
+}
 
 /**
  * Initialize the background script
@@ -240,7 +272,7 @@ async function verifyContent(url: string): Promise<any> {
         verified: false,
         reason: "No signed-section found on this page",
         verifiedAt: Date.now(),
-        domain: new URL(url).hostname,
+        domain: serializedOrigin(url),
         trustStatus: "unknown",
       };
     } else {
@@ -249,11 +281,15 @@ async function verifyContent(url: string): Promise<any> {
       // resolver chain is built from the user's configured directory list;
       // empty list still works for did:web and direct-URL keyids.
       const directories = getTrustDirectoryUrls(settings);
-      const resolverChain = defaultResolverChain({ directories });
+      const resolverChain = defaultResolverChain({
+        directories,
+        fetch: createVerifierFetch(),
+      });
 
       const verify = await verifySignedSection(sectionHtml, {
         keyResolvers: resolverChain,
-        domain: new URL(url).hostname,
+        domain: serializedOrigin(url),
+        debug: settings.developerDebugLogging === true,
       });
 
       // Best-effort author name lookup. The author DB is server-side and
@@ -283,7 +319,7 @@ async function verifyContent(url: string): Promise<any> {
         verificationResult = {
           verified: true,
           verifiedAt: Date.now(),
-          domain: new URL(url).hostname,
+          domain: serializedOrigin(url),
           user: {
             id: userId,
             name: userName,
@@ -298,7 +334,7 @@ async function verifyContent(url: string): Promise<any> {
           verified: false,
           reason: verify.reason || "Signature verification failed",
           verifiedAt: Date.now(),
-          domain: new URL(url).hostname,
+          domain: serializedOrigin(url),
           trustStatus: "untrusted",
         };
       }
@@ -394,7 +430,7 @@ async function signContent(
     // Sign the content
     const signature = await contentSigningClient.signContent(
       extractedContent.contentHash,
-      new URL(url).hostname,
+      serializedOrigin(url),
       claims,
     );
 
@@ -412,7 +448,7 @@ async function signContent(
           }
         : undefined,
       verifiedAt: Date.now(),
-      domain: new URL(url).hostname,
+      domain: serializedOrigin(url),
       trustStatus: "trusted",
     };
 
@@ -427,51 +463,66 @@ async function signContent(
     // Update the badge
     updateBadge();
 
-    // Inject the signature into the page as a <signed-section> element
+    // Inject the signature into the page as a <signed-section> element.
+    //
+    // Everything below the validation step comes from the trust server's
+    // response. It is passed to executeFunction as structured-cloned arguments,
+    // never interpolated into a script string, so a hostile or compromised
+    // server cannot get code to run in the page. The validation is a second
+    // line of defence and also keeps malformed signatures out of the DOM.
     const activeServer = authService.getActiveServerConfig();
     const serverUrl = activeServer ? activeServer.url.replace(/\/+$/, "") : "";
-    const claimsJson = JSON.stringify(signature.claims || {})
-      .replace(/\\/g, "\\\\")
-      .replace(/'/g, "\\'");
     const signedAt = signature.createdAt || new Date().toISOString();
-    await platformAdapter.executeScript<void>(
+    const injection = {
+      signature: requireCanonicalBase64(signature.signature, "signature"),
+      keyid: buildKeyidUrl(serverUrl, signature.authorId),
+      contentHash: requireContentHash(signature.contentHash),
+      signedAt: requireTimestamp(signedAt, "createdAt"),
+      claims: sanitizeClaims(signature.claims),
+    };
+
+    await platformAdapter.executeFunction<[typeof injection], void>(
       currentTab.id,
-      `
-      (() => {
+      (data) => {
         // Remove any existing signature elements
-        document.querySelectorAll('signed-section[signature]').forEach(el => el.remove());
+        document
+          .querySelectorAll("signed-section[signature]")
+          .forEach((el) => el.remove());
 
         // Find the main content element
-        const content = document.querySelector('article') || document.querySelector('main') || document.querySelector('.content') || document.body;
+        const content =
+          document.querySelector("article") ||
+          document.querySelector("main") ||
+          document.querySelector(".content") ||
+          document.body;
 
         // Create a signed-section element with the signature
-        const signedSection = document.createElement('signed-section');
-        signedSection.setAttribute('signature', '${signature.signature}');
-        signedSection.setAttribute('keyid', '${serverUrl}/api/authors/${signature.authorId}/public-key');
-        signedSection.setAttribute('algorithm', 'ed25519');
-        signedSection.setAttribute('content-hash', '${signature.contentHash}');
+        const signedSection = document.createElement("signed-section");
+        signedSection.setAttribute("signature", data.signature);
+        signedSection.setAttribute("keyid", data.keyid);
+        signedSection.setAttribute("algorithm", "ed25519");
+        signedSection.setAttribute("content-hash", data.contentHash);
 
         // Add timestamp meta
-        const timestampMeta = document.createElement('meta');
-        timestampMeta.setAttribute('name', 'signed-at');
-        timestampMeta.setAttribute('content', '${signedAt}');
+        const timestampMeta = document.createElement("meta");
+        timestampMeta.setAttribute("name", "signed-at");
+        timestampMeta.setAttribute("content", data.signedAt);
         signedSection.appendChild(timestampMeta);
 
         // Add claims meta tags
-        const claims = JSON.parse('${claimsJson}');
-        for (const [key, value] of Object.entries(claims)) {
-          const claimMeta = document.createElement('meta');
-          claimMeta.setAttribute('name', 'claim:' + key);
-          claimMeta.setAttribute('content', String(value));
+        for (const [key, value] of data.claims) {
+          const claimMeta = document.createElement("meta");
+          claimMeta.setAttribute("name", "claim:" + key);
+          claimMeta.setAttribute("content", value);
           signedSection.appendChild(claimMeta);
         }
 
-        signedSection.style.display = 'none';
+        signedSection.style.display = "none";
 
         // Insert after the content
-        content.parentNode.insertBefore(signedSection, content.nextSibling);
-      })()
-    `,
+        content.parentNode?.insertBefore(signedSection, content.nextSibling);
+      },
+      [injection],
     );
 
     return {

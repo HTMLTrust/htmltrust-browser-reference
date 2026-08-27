@@ -58,13 +58,20 @@ function fixture(html: string): void {
  * Mirror of buildAutoBadges() — kept in lockstep so this test exercises the
  * same class-wiring logic the content script applies in the page.
  */
-function buildAutoBadges(verify: any, trust: any): HTMLElement {
+function buildAutoBadges(
+  verify: any,
+  trust: any,
+  inputState: 'source-only' | 'stale' | 'rendered-match' = 'rendered-match',
+): HTMLElement {
   const badges = document.createElement('div');
   badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
 
   const sigBadge = document.createElement('span');
-  if (verify.valid) {
+  const renderedValid = verify.valid && inputState === 'rendered-match';
+  if (renderedValid) {
     sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
+  } else if (verify.valid) {
+    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_WARNING} ${CSS_CLASSES.VALIDITY_BADGE}`;
   } else {
     sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
   }
@@ -106,7 +113,7 @@ async function autoVerifyPage(): Promise<void> {
     try {
       const verify = await (verifySignedSection as jest.Mock)(section, {
         keyResolvers: [],
-        domain: 'test.example',
+        domain: 'https://test.example',
       });
       const trust = await (evaluateTrustPolicy as jest.Mock)(verify, {
         personalTrustList: [],
@@ -160,6 +167,25 @@ describe('content script auto-verify (selector and badge wiring)', () => {
 
     expect(verifySignedSection).toHaveBeenCalledTimes(2);
     expect(evaluateTrustPolicy).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes a serialized origin and leaves verifier debug disabled by default', async () => {
+    fixture(`<signed-section signature="sig">x</signed-section>`);
+    (verifySignedSection as jest.Mock).mockResolvedValue({
+      valid: true,
+      keyid: 'did:web:example.test',
+    });
+    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
+      score: 80,
+      indicator: 'green',
+      inputs: [],
+    });
+
+    await autoVerifyPage();
+
+    const [, options] = (verifySignedSection as jest.Mock).mock.calls[0];
+    expect(options.domain).toBe('https://test.example');
+    expect(options.debug).toBeUndefined();
   });
 
   it('applies the verified badge classes when the signature is valid', async () => {
@@ -227,6 +253,21 @@ describe('content script auto-verify (selector and badge wiring)', () => {
     expect(
       badges!.querySelector(`.${CSS_CLASSES.TRUST_BADGE_UNKNOWN}`),
     ).not.toBeNull();
+  });
+
+  it('uses a warning badge for source-valid but stale rendered content', () => {
+    const badges = buildAutoBadges(
+      { valid: true, keyid: 'did:web:example.test' },
+      { score: 80, indicator: 'green', inputs: [] },
+      'stale',
+    );
+
+    expect(
+      badges.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`),
+    ).not.toBeNull();
+    expect(
+      badges.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`),
+    ).toBeNull();
   });
 
   it('inserts an error badge if verification throws', async () => {

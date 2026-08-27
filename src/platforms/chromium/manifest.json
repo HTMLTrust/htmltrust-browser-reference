@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Content Signing",
   "version": "1.0.0",
-  "description": "Sign and verify web content using WebAuthn",
+  "description": "Sign and verify HTMLTrust signed-section content in the page",
   "icons": {
     "16": "assets/icon-16.png",
     "48": "assets/icon-48.png",
@@ -21,13 +21,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
       "js": ["content.js"],
       "css": ["assets/content.css"]
     }
   ],
   "permissions": ["storage", "tabs", "notifications", "alarms", "scripting"],
-  "host_permissions": ["https://*/*", "http://*/*"],
+  "host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
@@ -35,7 +35,7 @@
   "web_accessible_resources": [
     {
       "resources": ["assets/*"],
-      "matches": ["<all_urls>"]
+      "matches": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"]
     }
   ]
 }
