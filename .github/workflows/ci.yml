@@ -62,7 +62,7 @@ jobs:
 
       - name: Lint
         working-directory: htmltrust-browser-reference
-        run: npx eslint src/ --ext .ts,.tsx || true
+        run: npm run lint
 
       - name: Run tests
         working-directory: htmltrust-browser-reference
