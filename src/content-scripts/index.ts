@@ -7,8 +7,8 @@
  *      this script as document_idle equivalent for content_scripts), find
  *      every <signed-section[signature]> on the page, verify each via
  *      @htmltrust/browser-client (Layer 1, SubtleCrypto-backed), evaluate the
- *      trust policy locally (Layer 2), and inject the corresponding badges
- *      inline next to each section. No popup interaction required.
+ *      trust policy locally (Layer 2), and inject the corresponding status
+ *      marker beside each section. No popup interaction required.
  *
  *   2. Preserve the existing popup-driven flow. The background script can
  *      still push a richer VerificationResult via UPDATE_VERIFICATION_UI, in
@@ -22,7 +22,6 @@
  */
 import {
   verifySignedSection,
-  extractSignedSections,
   evaluateTrustPolicy,
   defaultResolverChain,
   type VerifyResult,
@@ -32,6 +31,13 @@ import {
 } from '@htmltrust/browser-client';
 import { MESSAGE_TYPES, CSS_CLASSES, TRUST_STATUS, STORAGE_KEYS } from '../core/common/constants';
 import { ContentProcessor } from '../core/content';
+import {
+  captureNavigationSnapshot,
+  mapSnapshotToLiveSections,
+  observeSignedSection,
+  SIGNED_SECTION_SELECTOR,
+  type NavigationSnapshot,
+} from '../core/content/navigation-lifecycle';
 import { PlatformAdapter, MessageContext } from '../platforms/common';
 import {
   VerificationResult,
@@ -91,6 +97,17 @@ type SectionVerificationRun = {
 
 /** Module-scoped cache of this page's verification results. */
 const pageVerifications: PageVerification[] = [];
+const pageVerificationBySection = new WeakMap<Element, PageVerification>();
+const sectionObserverDisposers = new WeakMap<Element, () => void>();
+let navigationSnapshot: NavigationSnapshot | null = null;
+let observedSections = new Set<Element>();
+let rerenderObserver: MutationObserver | null = null;
+let navigationRun = 0;
+let rerenderTimer: ReturnType<typeof setTimeout> | null = null;
+let navigationPollTimer: ReturnType<typeof setInterval> | null = null;
+let lastObservedUrl = '';
+let lifecycleInstalled = false;
+const sectionReverifyGeneration = new WeakMap<Element, number>();
 
 /**
  * Pull authorId out of a `.../authors/{id}/public-key` keyid URL. Returns
@@ -135,10 +152,11 @@ async function initialize() {
       directories,
       fetch: createVerifierFetch(),
     });
+    installNavigationLifecycle();
 
     // 2. Auto-verify on page load. Idempotent: re-running is a no-op for
     //    sections that already have an auto badge container next to them.
-    await autoVerifyPage(currentResolverChain, currentSettings);
+    await autoVerifyPage(currentResolverChain, currentSettings, navigationRun);
 
     // 3. Legacy popup path: notify background, optionally apply richer UI
     //    on UPDATE_VERIFICATION_UI messages. This is best-effort and
@@ -160,6 +178,10 @@ async function initialize() {
         const next = changes[STORAGE_KEYS.SETTINGS].newValue as Settings | undefined;
         if (!next) return;
         currentSettings = next;
+        currentResolverChain = defaultResolverChain({
+          directories: getTrustDirectoryUrls(next),
+          fetch: createVerifierFetch(),
+        });
         redecoratePage();
       });
     }
@@ -175,22 +197,16 @@ async function initialize() {
  */
 function redecoratePage(): void {
   if (!currentSettings) return;
-  const sections = document.querySelectorAll(`signed-section[signature]`);
+  const sections = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
   // Clear our existing additions on every section we've touched.
   sections.forEach((section) => {
-    section.classList.remove(
-      SECTION_DECORATED_CLASS,
-      CSS_CLASSES.CONTENT_OUTLINE,
-      CSS_CLASSES.VERIFIED_CONTENT,
-      CSS_CLASSES.UNVERIFIED_CONTENT,
-    );
-    (section as HTMLElement).removeAttribute('title');
-    section.querySelectorAll(`.${AUTO_BADGE_MARKER}`).forEach((b) => b.remove());
+    clearSectionStatusUI(section);
   });
   // Re-apply using cached results so we don't rerun verification.
   const list = Array.from(sections);
-  for (let i = 0; i < list.length && i < pageVerifications.length; i++) {
-    const cached = pageVerifications[i];
+  for (const section of list) {
+    const cached = pageVerificationBySection.get(section);
+    if (!cached) continue;
     // Reconstruct a minimal VerifyResult/TrustEvaluation shape for the UI
     // applier. The cache is intentionally a flat snapshot; the original
     // objects don't survive across the listener boundary.
@@ -220,8 +236,77 @@ function redecoratePage(): void {
       displayValid: cached.valid,
       reason: cached.reason,
     };
-    applySectionStatusUI(list[i], runShape, trustShape, cached.reason, currentSettings);
+    applySectionStatusUI(section, runShape, trustShape, cached.reason, currentSettings);
   }
+}
+
+/** Reset cached state before a same-document navigation or page rerender. */
+function resetNavigationState(): void {
+  navigationRun += 1;
+  if (rerenderTimer !== null) {
+    clearTimeout(rerenderTimer);
+    rerenderTimer = null;
+  }
+  observedSections.forEach((section) => {
+    sectionReverifyGeneration.set(section, (sectionReverifyGeneration.get(section) ?? 0) + 1);
+    sectionObserverDisposers.get(section)?.();
+    clearSectionStatusUI(section);
+  });
+  observedSections = new Set<Element>();
+  pageVerifications.length = 0;
+  navigationSnapshot = null;
+}
+
+function scheduleNavigationRefresh(): void {
+  if (rerenderTimer !== null) return;
+  resetNavigationState();
+  lastObservedUrl = window.location.href;
+  rerenderTimer = setTimeout(() => {
+    rerenderTimer = null;
+    if (!currentSettings || !currentSettings.autoVerify) return;
+    void autoVerifyPage(currentResolverChain, currentSettings, navigationRun);
+  }, 0);
+}
+
+/** Watch history events and replacement of signed sections by SPA renderers. */
+function installNavigationLifecycle(): void {
+  if (lifecycleInstalled) return;
+  lifecycleInstalled = true;
+  lastObservedUrl = window.location.href;
+  const notify = () => scheduleNavigationRefresh();
+  window.addEventListener('popstate', notify);
+  window.addEventListener('hashchange', notify);
+  for (const method of ['pushState', 'replaceState'] as const) {
+    const original = window.history[method];
+    window.history[method] = function (...args) {
+      const result = original.apply(this, args);
+      notify();
+      return result;
+    };
+  }
+  rerenderObserver = new MutationObserver(() => {
+    const current = new Set(document.querySelectorAll(SIGNED_SECTION_SELECTOR));
+    if (current.size !== observedSections.size || [...current].some((section) => !observedSections.has(section))) {
+      notify();
+    }
+  });
+  if (document.documentElement) {
+    rerenderObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+  // Extension content scripts run in an isolated JavaScript world in Chromium.
+  // A page-world pushState call may bypass the wrapper above, so compare the
+  // shared location on a short interval as a cross-browser fallback.
+  navigationPollTimer = setInterval(() => {
+    if (window.location.href !== lastObservedUrl) notify();
+  }, 500);
+  window.addEventListener('pagehide', () => {
+    if (navigationPollTimer !== null) {
+      clearInterval(navigationPollTimer);
+      navigationPollTimer = null;
+    }
+    rerenderObserver?.disconnect();
+    observedSections.forEach((section) => sectionObserverDisposers.get(section)?.());
+  }, { once: true });
 }
 
 /**
@@ -303,13 +388,13 @@ function createVerifierFetch(): typeof fetch {
 }
 
 async function fetchPristineSignedSections(settings: Settings): Promise<{
-  slices: string[];
+  snapshot: NavigationSnapshot | null;
   error: string | null;
 }> {
   const pageUrl = new URL(window.location.href);
   if (pageUrl.protocol !== 'https:') {
     return {
-      slices: [],
+      snapshot: null,
       error: 'network-policy-blocked: source refetch requires HTTPS',
     };
   }
@@ -323,17 +408,20 @@ async function fetchPristineSignedSections(settings: Settings): Promise<{
       redirect: 'error',
     });
     if (!pageResp.ok) {
-      return { slices: [], error: `source-refetch-failed: HTTP ${pageResp.status}` };
+      return { snapshot: null, error: `source-refetch-failed: HTTP ${pageResp.status}` };
     }
     if (new URL(pageResp.url).origin !== currentOrigin()) {
-      return { slices: [], error: 'network-policy-blocked: source refetch changed origin' };
+      return { snapshot: null, error: 'network-policy-blocked: source refetch changed origin' };
     }
     const pageHTML = await pageResp.text();
-    return { slices: extractSignedSections(pageHTML), error: null };
+    return {
+      snapshot: captureNavigationSnapshot(pageHTML, pageResp.url || window.location.href),
+      error: null,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     debugLog(settings, 'source refetch failed', { reason: message });
-    return { slices: [], error: `source-refetch-failed: ${message}` };
+    return { snapshot: null, error: `source-refetch-failed: ${message}` };
   }
 }
 
@@ -399,26 +487,27 @@ async function verifySectionWithState(
 /**
  * Walk every <signed-section[signature]> on the page and verify it locally.
  *
- * Each section is verified independently — a failure on one does not skip
- * the others. Badges are inserted as the next sibling of the section
- * element, matching the e2e harness's visual placement.
+ * Each section is verified independently. A failure on one does not skip
+ * the others. Markers are inserted as the next sibling of the section
+ * element, keeping extension-owned nodes out of signed content.
  *
- * Idempotent: if a section already has an auto-badge sibling, it's skipped.
+ * Idempotent: if a section already has an auto-marker sibling, it's skipped.
  * This protects against re-runs (e.g. the script being injected twice on a
  * page that does its own DOM manipulation).
  */
 async function autoVerifyPage(
   resolverChain: KeyResolver[],
   settings: Settings,
+  expectedNavigationRun = navigationRun,
 ): Promise<void> {
   // `autoVerify` gates the entire content-script verification path. When off,
   // the page is left untouched and the popup's "Verifying…" state stays put
   // until the user explicitly triggers verification.
-  if (!settings.autoVerify) {
+  if (!settings.autoVerify || expectedNavigationRun !== navigationRun) {
     return;
   }
 
-  const sections = document.querySelectorAll('signed-section[signature]');
+  const sections = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
   if (sections.length === 0) {
     // Graceful no-op: pages without signed-sections are common and not an error.
     return;
@@ -438,47 +527,53 @@ async function autoVerifyPage(
   // hashed. Documented as "Known Issue: Runtime DOM Mutation" in the spec
   // README.
   //
-  // The DOM section is still used for UI placement (badge anchor, decoration)
-  // — only the bytes fed to verifySignedSection come from the pristine fetch.
+  // The DOM section is used for UI placement only. The bytes fed to
+  // verifySignedSection come from the pristine fetch.
   //
-  // Pristine slices are position-paired with live DOM sections by document
-  // order. A page that re-orders signed-sections at runtime would defeat
-  // this pairing; that case is out of scope (would also defeat any
-  // signature-validity semantics).
+  // The parser-backed mapper pairs source sections by their signed identity,
+  // so a page that re-orders sections cannot swap one source signature for
+  // another.
   //
   // Fetch is cache-friendly: 'force-cache' lets the browser HTTP cache
   // serve this near-instantaneously on the typical reload-after-load path.
   // On the first load it's a duplicate of the navigation, which the HTTP
   // cache catches per RFC 7234 when the origin sets reasonable cache headers.
-  const { slices: fetchedPristineSlices, error: pristineFetchError } =
+  const { snapshot: fetchedSnapshot, error: pristineFetchError } =
     await fetchPristineSignedSections(settings);
-  let pristineSlices = fetchedPristineSlices;
+  if (expectedNavigationRun !== navigationRun) return;
+  navigationSnapshot = fetchedSnapshot;
+  const liveSections = Array.from(sections);
+  observedSections = new Set(liveSections);
+  const mapped = fetchedSnapshot
+    ? mapSnapshotToLiveSections(fetchedSnapshot, liveSections)
+    : { matches: [], complete: false };
 
   // If the pristine fetch failed entirely OR returned a different count
   // than the DOM (page re-rendered between navigation and our fetch, SPA
   // route change, intercepting service worker), we fall back to per-section
   // DOM-based verification. The runtime-mutation false-invalid risk
   // re-applies, but it's better than no verification at all.
-  if (pristineFetchError || pristineSlices.length !== sections.length) {
+  if (pristineFetchError || !mapped.complete) {
     debugLog(settings, 'source snapshot unavailable; falling back to rendered DOM verification', {
       reason: pristineFetchError,
-      sourceSections: pristineSlices.length,
+      sourceSections: fetchedSnapshot?.sections.length ?? 0,
       renderedSections: sections.length,
     });
-    pristineSlices = [];
+    navigationSnapshot = null;
   }
 
   let i = 0;
-  for (const section of Array.from(sections)) {
+  for (const section of liveSections) {
+    if (expectedNavigationRun !== navigationRun) return;
     // Idempotency: skip sections we've already decorated.
-    if (section.classList.contains(SECTION_DECORATED_CLASS)) {
+    if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
       continue;
     }
 
     try {
       const run = await verifySectionWithState(
         section,
-        pristineSlices.length ? pristineSlices[i] : null,
+        mapped.complete ? (mapped.matches.find((match) => match.live === section)?.source.outerHTML ?? null) : null,
         resolverChain,
         settings,
       );
@@ -499,7 +594,7 @@ async function autoVerifyPage(
       });
 
       applySectionStatusUI(section, run, trust, null, settings);
-      pageVerifications.push({
+      const pageVerification: PageVerification = {
         index: i,
         valid: run.displayValid,
         cryptoValid: verify.valid,
@@ -515,13 +610,16 @@ async function autoVerifyPage(
         signedAt: verify.signedAt,
         domain: verify.domain,
         claims: verify.claims ?? {},
-      });
+      };
+      pageVerifications.push(pageVerification);
+      pageVerificationBySection.set(section, pageVerification);
+      armSectionMutationInvalidation(section, mapped.complete ? (mapped.matches.find((match) => match.live === section)?.source.outerHTML ?? null) : null, resolverChain, settings);
     } catch (err) {
       const reason = (err as Error).message ?? 'verification error';
       console.error('Content Signing: verification failed for a signed-section');
       debugLog(settings, 'signed-section verification exception', { reason });
       applySectionStatusUI(section, null, null, reason, settings);
-      pageVerifications.push({
+      const pageVerification: PageVerification = {
         index: i,
         valid: false,
         cryptoValid: false,
@@ -537,19 +635,21 @@ async function autoVerifyPage(
         signedAt: '',
         domain: currentOrigin(),
         claims: {},
-      });
+      };
+      pageVerifications.push(pageVerification);
+      pageVerificationBySection.set(section, pageVerification);
+      armSectionMutationInvalidation(section, null, resolverChain, settings);
     }
     i++;
   }
 }
 
-/** Class added to a signed-section once we've decorated it. */
-const SECTION_DECORATED_CLASS = 'cs-decorated';
-
 /**
- * Apply quiet, per-section visual cues directly to the signed-section:
- *   - dotted outline whose color reflects signature validity
- *   - tiny circular ✓/✗ badge in the top-right
+ * Apply quiet, per-section visual cues beside the signed-section.
+ *
+ * The indicator is always a sibling. It never becomes a child of the signed
+ * element, so extension-owned nodes cannot enter the signed verification
+ * input. The same rule applies to the legacy popup path below.
  *
  * Three settings gate what gets drawn:
  *   - showBadges:         master switch. Off = no decoration at all.
@@ -566,23 +666,21 @@ function applySectionStatusUI(
   errorReason: string | null,
   settings: Settings,
 ): void {
-  // Mark the section as decorated regardless of settings so we don't redo
-  // verification on it. (The verify result is already cached for the popup.)
-  section.classList.add(SECTION_DECORATED_CLASS);
-
   // Master kill switch.
+  clearSectionStatusUI(section);
   if (!settings.showBadges) return;
 
   const verify = run?.verify ?? null;
   const valid = run?.displayValid === true;
   const stale = run?.inputState === 'stale';
-  if (valid && settings.highlightVerified) {
-    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.VERIFIED_CONTENT);
-  } else if (stale && settings.highlightVerified) {
-    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.UNKNOWN_CONTENT);
-  } else if (!valid && settings.highlightUnverified) {
-    section.classList.add(CSS_CLASSES.CONTENT_OUTLINE, CSS_CLASSES.UNVERIFIED_CONTENT);
-  }
+  const outlineClass =
+    valid && settings.highlightVerified
+      ? CSS_CLASSES.VERIFIED_CONTENT
+      : stale && settings.highlightVerified
+      ? CSS_CLASSES.UNKNOWN_CONTENT
+      : !valid && settings.highlightUnverified
+      ? CSS_CLASSES.UNVERIFIED_CONTENT
+      : null;
 
   // Tooltip carries a short warning only. The extension popup is the
   // authoritative, less-spoofable surface for details.
@@ -599,10 +697,11 @@ function applySectionStatusUI(
   const tooltip = `HTMLTrust page marker only; open the extension popup for authoritative details. ${statePart}${trustPart}${
     reason ? ` (${reason})` : ''
   }`;
-  (section as HTMLElement).title = tooltip;
-
   const badges = document.createElement('div');
   badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
+  if (outlineClass) badges.classList.add(CSS_CLASSES.CONTENT_OUTLINE, outlineClass);
+  badges.setAttribute('role', 'status');
+  badges.setAttribute('aria-label', tooltip);
   const sig = document.createElement('span');
   sig.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VALIDITY_BADGE} ${
     valid
@@ -614,7 +713,116 @@ function applySectionStatusUI(
   sig.textContent = valid ? '✓' : stale || verify?.valid ? '!' : '✗';
   sig.title = tooltip;
   badges.appendChild(sig);
-  section.appendChild(badges);
+  section.parentNode?.insertBefore(badges, section.nextSibling);
+}
+
+/** Remove only extension-owned sibling UI, leaving signed content untouched. */
+function clearSectionStatusUI(section: Element): void {
+  let sibling = section.nextElementSibling;
+  while (sibling?.classList.contains(AUTO_BADGE_MARKER)) {
+    const next = sibling.nextElementSibling;
+    sibling.remove();
+    sibling = next;
+  }
+}
+
+/** Re-verify a section after live content changes, against its frozen source. */
+function armSectionMutationInvalidation(
+  section: Element,
+  sourceSlice: string | null,
+  resolverChain: KeyResolver[],
+  settings: Settings,
+): void {
+  sectionObserverDisposers.get(section)?.();
+  const observerNavigationRun = navigationRun;
+  const dispose = observeSignedSection(section, (changedSection) => {
+    const generation = (sectionReverifyGeneration.get(changedSection) ?? 0) + 1;
+    sectionReverifyGeneration.set(changedSection, generation);
+    clearSectionStatusUI(changedSection);
+    const activeSettings = currentSettings ?? settings;
+    applySectionStatusUI(
+      changedSection,
+      null,
+      null,
+      'signed content changed; re-verifying',
+      activeSettings,
+    );
+
+    void (async () => {
+      try {
+        const run = await verifySectionWithState(
+          changedSection,
+          sourceSlice,
+          currentResolverChain.length ? currentResolverChain : resolverChain,
+          activeSettings,
+        );
+        const trust = await evaluateTrustPolicy(run.verify, {
+          personalTrustList: activeSettings.personalTrustList ?? [],
+          trustedDomains: activeSettings.trustedDomains ?? [],
+          directorySubscriptions: [],
+        });
+        if (
+          sectionReverifyGeneration.get(changedSection) !== generation ||
+          navigationRun !== observerNavigationRun
+        ) return;
+        applySectionStatusUI(changedSection, run, trust, null, activeSettings);
+        const existing = pageVerificationBySection.get(changedSection);
+        if (!existing) return;
+        const updated: PageVerification = {
+          ...existing,
+          valid: run.displayValid,
+          cryptoValid: run.verify.valid,
+          inputState: run.inputState,
+          sourceVerified: run.sourceVerified,
+          renderedVerified: run.renderedVerified,
+          reason: run.reason,
+          trustScore: trust.score,
+          trustIndicator: trust.indicator,
+          trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+          keyid: run.verify.keyid,
+          algorithm: run.verify.algorithm,
+          signedAt: run.verify.signedAt,
+          domain: run.verify.domain,
+          claims: run.verify.claims ?? {},
+        };
+        pageVerificationBySection.set(changedSection, updated);
+        const index = pageVerifications.indexOf(existing);
+        if (index >= 0) pageVerifications[index] = updated;
+      } catch (error) {
+        if (
+          sectionReverifyGeneration.get(changedSection) !== generation ||
+          navigationRun !== observerNavigationRun
+        ) return;
+        const reason = error instanceof Error ? error.message : String(error);
+        applySectionStatusUI(
+          changedSection,
+          null,
+          null,
+          reason,
+          activeSettings,
+        );
+        const existing = pageVerificationBySection.get(changedSection);
+        if (existing) {
+          const failed: PageVerification = {
+            ...existing,
+            valid: false,
+            cryptoValid: false,
+            inputState: 'stale',
+            sourceVerified: false,
+            renderedVerified: false,
+            reason,
+            trustScore: 0,
+            trustIndicator: 'red',
+            trustLabel: 'Untrusted',
+          };
+          pageVerificationBySection.set(changedSection, failed);
+          const index = pageVerifications.indexOf(existing);
+          if (index >= 0) pageVerifications[index] = failed;
+        }
+      }
+    })();
+  });
+  sectionObserverDisposers.set(section, dispose);
 }
 
 /**
@@ -791,20 +999,6 @@ function applyVerificationUIToElement(
   verificationResult: VerificationResult,
   settings: NonNullable<VerificationResult['settings']>
 ) {
-  // Add content outline class
-  element.classList.add(CSS_CLASSES.CONTENT_OUTLINE);
-
-  // Determine verification status class
-  if (verificationResult.verified) {
-    if (settings.highlightVerified) {
-      element.classList.add(CSS_CLASSES.VERIFIED_CONTENT);
-    }
-  } else {
-    if (settings.highlightUnverified) {
-      element.classList.add(CSS_CLASSES.UNVERIFIED_CONTENT);
-    }
-  }
-
   // Add verification badges if enabled
   if (settings.showBadges) {
     addVerificationBadges(element, verificationResult);
@@ -816,9 +1010,10 @@ function applyVerificationUIToElement(
  */
 function addVerificationBadges(element: Element, verificationResult: VerificationResult) {
   try {
+    clearSectionStatusUI(element);
     // Create badge container
     const badgeContainer = document.createElement('div');
-    badgeContainer.className = CSS_CLASSES.VERIFICATION_BADGES;
+    badgeContainer.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
 
     // Add validity badge
     const validityBadge = createValidityBadge(verificationResult);
@@ -828,8 +1023,9 @@ function addVerificationBadges(element: Element, verificationResult: Verificatio
     const trustBadge = createTrustBadge(verificationResult);
     badgeContainer.appendChild(trustBadge);
 
-    // Add the badge container to the element
-    element.appendChild(badgeContainer);
+    // Keep extension UI outside the signed element. This prevents a badge or
+    // tooltip from becoming part of the bytes that the signature protects.
+    element.parentNode?.insertBefore(badgeContainer, element.nextSibling);
   } catch (error) {
     console.error('Failed to add verification badges:', error);
   }
@@ -1040,13 +1236,20 @@ function listenForMessages() {
           applyVerificationUI(message.verificationResult);
           return { success: true };
         case 'GET_PAGE_VERIFICATIONS':
+        {
           // Popup reads the per-section results from here. Snapshot to keep
-          // the array immutable from the caller's perspective.
+          // both the array and each record immutable from the caller's
+          // perspective. The popup cannot mutate the content script cache.
+          const results = pageVerifications.map((result) => Object.freeze({ ...result }));
           return {
             url: window.location.href,
             domain: currentOrigin(),
-            results: pageVerifications.slice(),
+            snapshot: navigationSnapshot
+              ? { url: navigationSnapshot.url, capturedAt: navigationSnapshot.capturedAt, sectionCount: navigationSnapshot.sections.length }
+              : null,
+            results: Object.freeze(results),
           };
+        }
         case MESSAGE_TYPES.VOTE_ACKNOWLEDGED:
           if (message.authorId) {
             const upvoteButtons = document.querySelectorAll(
