@@ -8,9 +8,12 @@
  * elements.
  */
 
-export const SIGNED_SECTION_SELECTOR = 'signed-section[signature]';
+/** Every signed-section is inspected, including malformed ones. */
+export const SIGNED_SECTION_SELECTOR = 'signed-section';
 
 const IDENTITY_ATTRIBUTES = [
+  'profile',
+  'signature-scope',
   'signature',
   'keyid',
   'algorithm',
@@ -23,9 +26,16 @@ export interface SignedSectionSnapshot {
   readonly outerHTML: string;
 }
 
+// Keep parser nodes out of the public/frozen snapshot records. The weak map
+// still lets the content script verify the exact parser tree without
+// serializing nested sections and reparsing them through a different path.
+const sourceElements = new WeakMap<SignedSectionSnapshot, Element>();
+
 export interface NavigationSnapshot {
   readonly url: string;
   readonly origin: string;
+  /** HTML document base URL computed from the accepted source response. */
+  readonly baseUrl: string;
   readonly capturedAt: number;
   readonly sections: readonly SignedSectionSnapshot[];
 }
@@ -38,9 +48,9 @@ export interface SnapshotSectionMatch {
 /**
  * Capture signed sections from the post-load, same-URL response snapshot.
  *
- * The returned values are deeply immutable from the caller's perspective.
- * The raw response is deliberately not retained, which limits accidental use
- * of mutable strings or a later DOM serialization as verification input.
+ * The returned records are immutable. Parser-owned source nodes remain private
+ * behind sourceElementForSnapshot, so callers cannot replace the verification
+ * input with a later DOM serialization or a live page node.
  */
 export function captureNavigationSnapshot(
   html: string,
@@ -53,6 +63,17 @@ export function captureNavigationSnapshot(
   }
 
   const parsed = new DOMParser().parseFromString(html, 'text/html');
+  const baseElement = parsed.querySelector('base[href]');
+  let baseUrl = url;
+  if (baseElement) {
+    try {
+      baseUrl = new URL(baseElement.getAttribute('href') ?? '', url).href;
+    } catch {
+      // The canonicalizer will reject an unsafe/invalid signed URL. Keep the
+      // response URL here so capture itself remains a pure snapshot operation.
+      baseUrl = url;
+    }
+  }
   const sections = Array.from(parsed.querySelectorAll(SIGNED_SECTION_SELECTOR)).map(
     (section, index): SignedSectionSnapshot => {
       const snapshot = {
@@ -60,16 +81,24 @@ export function captureNavigationSnapshot(
         identity: sectionIdentity(section),
         outerHTML: section.outerHTML,
       };
-      return Object.freeze(snapshot);
+      const frozen = Object.freeze(snapshot);
+      sourceElements.set(frozen, section);
+      return frozen;
     },
   );
 
   return Object.freeze({
     url,
     origin: new URL(url).origin,
+    baseUrl,
     capturedAt,
     sections: Object.freeze(sections),
   });
+}
+
+/** Retrieve the parser-owned source element for internal verification. */
+export function sourceElementForSnapshot(snapshot: SignedSectionSnapshot): Element | null {
+  return sourceElements.get(snapshot) ?? null;
 }
 
 /**
@@ -109,6 +138,55 @@ export function sectionIdentity(section: Element): string {
   return IDENTITY_ATTRIBUTES
     .map((name) => `${name}=${section.getAttribute(name) ?? ''}`)
     .join('\u001f');
+}
+
+/** Find the outermost signed ancestor, so markers remain outside nesting. */
+export function outermostSignedSection(section: Element): Element {
+  let anchor = section;
+  while (anchor.parentElement?.matches(SIGNED_SECTION_SELECTOR)) anchor = anchor.parentElement;
+  return anchor;
+}
+
+/** Return the current document base URL, including an applicable <base>. */
+export function documentBaseUrl(document: Document, fallbackUrl: string): string {
+  const base = document.querySelector('base[href]');
+  if (!base) return fallbackUrl;
+  try {
+    return new URL(base.getAttribute('href') ?? '', fallbackUrl).href;
+  } catch {
+    return fallbackUrl;
+  }
+}
+
+/** A mutation that can change the base URL used for signed URL attributes. */
+export function mutationTouchesDocumentBase(mutation: MutationRecord): boolean {
+  if (mutation.type === 'attributes') {
+    return mutation.target instanceof Element &&
+      mutation.target.localName.toLowerCase() === 'base' &&
+      mutation.attributeName === 'href';
+  }
+  if (mutation.type === 'childList') {
+    const nodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
+    return nodes.some((node) =>
+      node instanceof Element &&
+      (node.localName.toLowerCase() === 'base' || node.querySelector('base[href]') !== null),
+    );
+  }
+  return false;
+}
+
+/** Observe document-level <base href> changes without observing extension UI. */
+export function observeDocumentBase(
+  document: Document,
+  onInvalidated: () => void,
+): () => void {
+  const root = document.documentElement;
+  if (!root) return () => undefined;
+  const observer = new MutationObserver((mutations) => {
+    if (mutations.some(mutationTouchesDocumentBase)) onInvalidated();
+  });
+  observer.observe(root, { attributes: true, attributeFilter: ['href'], childList: true, subtree: true });
+  return () => observer.disconnect();
 }
 
 /**

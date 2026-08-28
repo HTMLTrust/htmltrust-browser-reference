@@ -7,8 +7,8 @@
  * verify here instead are the load-bearing invariants the migration is
  * supposed to guarantee:
  *
- *   1. The selector `signed-section[signature]` finds the elements the
- *      content script's autoVerifyPage walks over.
+ *   1. The selector `signed-section` finds every element the content
+ *      script's autoVerifyPage walks over, including malformed sections.
  *   2. Mocking @htmltrust/browser-client and replaying the same end-to-end
  *      shape autoVerifyPage uses produces a badge container with the
  *      expected CSS classes for both verified and unverified results, and
@@ -27,6 +27,7 @@
  * not apply to test fixtures.
  */
 import { CSS_CLASSES } from '../core/common/constants';
+import { SIGNED_SECTION_SELECTOR } from '../core/content/navigation-lifecycle';
 
 jest.mock('@htmltrust/browser-client', () => ({
   verifySignedSection: jest.fn(),
@@ -105,7 +106,7 @@ function buildErrorBadges(): HTMLElement {
  * isolates the DOM-walking + lib-invocation + badge-insertion logic.
  */
 async function autoVerifyPage(): Promise<void> {
-  const sections = document.querySelectorAll('signed-section[signature]');
+  const sections = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
   for (const section of Array.from(sections)) {
     if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
       continue;
@@ -135,17 +136,18 @@ describe('content script auto-verify (selector and badge wiring)', () => {
     jest.clearAllMocks();
   });
 
-  it('querySelectorAll(signed-section[signature]) finds signed sections only', () => {
+  it('querySelectorAll(signed-section) includes malformed sections for failure reporting', () => {
     fixture(`
       <signed-section signature="sig-1" id="s1">a</signed-section>
       <signed-section id="s2">b</signed-section>
       <div id="s3">c</div>
       <signed-section signature="sig-2" id="s4">d</signed-section>
     `);
-    const found = document.querySelectorAll('signed-section[signature]');
-    expect(found.length).toBe(2);
+    const found = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
+    expect(found.length).toBe(3);
     expect(found[0].id).toBe('s1');
-    expect(found[1].id).toBe('s4');
+    expect(found[1].id).toBe('s2');
+    expect(found[2].id).toBe('s4');
   });
 
   it('calls verifySignedSection for each signed-section on the page', async () => {
