@@ -248,7 +248,7 @@ function redecoratePage(): void {
 }
 
 /** Reset cached state before a same-document navigation or page rerender. */
-function resetNavigationState(): void {
+export function resetNavigationState(): void {
   navigationRun += 1;
   if (rerenderTimer !== null) {
     clearTimeout(rerenderTimer);
@@ -528,14 +528,14 @@ async function verifySectionWithState(
  * Walk every <signed-section> on the page and verify it locally.
  *
  * Each section is verified independently. A failure on one does not skip
- * the others. Markers are inserted as the next sibling of the section
- * element, keeping extension-owned nodes out of signed content.
+ * the others. Markers are inserted after the outermost signed section,
+ * keeping extension-owned nodes out of signed content even when sections nest.
  *
  * Idempotent: if a section already has an auto-marker sibling, it's skipped.
  * This protects against re-runs (e.g. the script being injected twice on a
  * page that does its own DOM manipulation).
  */
-async function autoVerifyPage(
+export async function autoVerifyPage(
   resolverChain: KeyResolver[],
   settings: Settings,
   expectedNavigationRun = navigationRun,
@@ -710,7 +710,7 @@ async function autoVerifyPage(
  * The user-facing detailed pills (Signature valid / Trust %) live in the
  * popup, not on the page.
  */
-function applySectionStatusUI(
+export function applySectionStatusUI(
   section: Element,
   run: SectionVerificationRun | null,
   trust: TrustEvaluation | null,
@@ -788,7 +788,7 @@ function clearSectionStatusUI(section: Element): void {
 }
 
 /** Re-verify a section after live content changes, against its frozen source. */
-function armSectionMutationInvalidation(
+export function armSectionMutationInvalidation(
   section: Element,
   sourceHTML: string | null,
   sourceDocumentUrl: string | null,
@@ -898,7 +898,7 @@ function armSectionMutationInvalidation(
  * same. CSS classes also match the existing content.css file so the
  * stylesheet shipped with the extension styles them correctly.
  */
-function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElement {
+export function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElement {
   const authorId = verify.keyid ? authorIdFromKeyid(verify.keyid) : null;
 
   const badges = document.createElement('div');
@@ -911,11 +911,19 @@ function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElem
 
   // Signature validity badge
   const sigBadge = document.createElement('span');
-  if (verify.valid) {
+  const renderedValid = verify.valid && verify.inputState === 'rendered-match';
+  if (renderedValid) {
     sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
     sigBadge.textContent = 'Rendered content verified';
     sigBadge.style.cssText =
       'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
+  } else if (verify.valid) {
+    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_WARNING} ${CSS_CLASSES.VALIDITY_BADGE}`;
+    sigBadge.textContent = verify.inputState === 'stale'
+      ? '⚠ Rendered content INVALID (source differs)'
+      : '⚠ Source signature valid; rendered content not verified';
+    sigBadge.style.cssText =
+      'background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px;';
   } else {
     sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
     sigBadge.textContent = `✗ Signature INVALID${verify.reason ? ` (${verify.reason})` : ''}`;
@@ -977,20 +985,6 @@ function buildVoteButton(
     'cursor: pointer; padding: 4px 8px; border: 1px solid #ccc; background: white; border-radius: 4px;';
   btn.addEventListener('click', handleVoteButtonClick);
   return btn;
-}
-
-function buildErrorBadges(reason: string): HTMLElement {
-  const badges = document.createElement('div');
-  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
-  badges.style.cssText =
-    'display: flex; gap: 8px; padding: 8px; margin: 8px 0; font-family: sans-serif; font-size: 14px; align-items: center;';
-  const sigBadge = document.createElement('span');
-  sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  sigBadge.textContent = `✗ Verification error: ${reason}`;
-  sigBadge.style.cssText =
-    'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
-  badges.appendChild(sigBadge);
-  return badges;
 }
 
 /**
@@ -1351,10 +1345,19 @@ function listenForMessages() {
  * DOMContentLoaded check handles the rare case where the script is
  * injected before the DOM is ready.
  */
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
+export function installContentScript(): void {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      initialize();
+    });
+  } else {
     initialize();
-  });
-} else {
-  initialize();
+  }
+}
+
+// Jest imports the production functions directly and sets this flag before
+// requiring the module. Packaged builds leave it unset, preserving the
+// existing document-idle bootstrap behavior exactly.
+if (!(globalThis as { __HTMLTRUST_TESTING__?: boolean }).__HTMLTRUST_TESTING__) {
+  installContentScript();
 }
