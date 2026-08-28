@@ -43,6 +43,11 @@ function buildExtension(browser) {
       stdio: 'inherit',
     });
 
+    execSync(`node scripts/check-bundle-size.js ${browser}`, {
+      cwd: path.resolve(__dirname, '..'),
+      stdio: 'inherit',
+    });
+
     // Create a zip file for the extension
     createZipFile(browser);
 

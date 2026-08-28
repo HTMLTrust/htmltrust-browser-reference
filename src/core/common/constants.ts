@@ -60,21 +60,6 @@ export const ERROR_CODES = {
 };
 
 /**
- * Message types for communication between extension components
- */
-export const MESSAGE_TYPES = {
-  VERIFY_CONTENT: 'VERIFY_CONTENT',
-  SIGN_CONTENT: 'SIGN_CONTENT',
-  UPDATE_SETTINGS: 'UPDATE_SETTINGS',
-  GET_SETTINGS: 'GET_SETTINGS',
-  AUTH_REQUEST: 'AUTH_REQUEST',
-  AUTH_RESPONSE: 'AUTH_RESPONSE',
-  CONTENT_DETECTED: 'CONTENT_DETECTED',
-  SUBMIT_VOTE: 'SUBMIT_VOTE',
-  VOTE_ACKNOWLEDGED: 'VOTE_ACKNOWLEDGED',
-};
-
-/**
  * Storage keys
  */
 export const STORAGE_KEYS = {
@@ -84,8 +69,6 @@ export const STORAGE_KEYS = {
   VERIFICATION_RESULTS: 'verificationResults',
   PROFILES: 'profiles',
   ACTIVE_PROFILE: 'activeProfile',
-  AUTHOR_VOTES: 'authorVotes', // Prefix for storing votes per author (e.g., 'authorVotes:authorId123')
-  PENDING_VOTES: 'pendingVotes', // Queue of votes pending submission to the server
 };
 
 /**
@@ -120,16 +103,6 @@ export const CSS_CLASSES = {
   VERIFICATION_BADGE_VERIFIED: 'cs-verification-badge-verified',
   VERIFICATION_BADGE_UNVERIFIED: 'cs-verification-badge-unverified',
   VERIFICATION_BADGE_WARNING: 'cs-verification-badge-warning',
-  TRUST_BADGE: 'cs-trust-badge',
-  TRUST_BADGE_TRUSTED: 'cs-trust-badge-trusted',
-  TRUST_BADGE_UNTRUSTED: 'cs-trust-badge-untrusted',
-  TRUST_BADGE_UNKNOWN: 'cs-trust-badge-unknown',
-  TOOLTIP: 'cs-tooltip',
-  VOTE_BUTTONS: 'cs-vote-buttons',
-  VOTE_BUTTON: 'cs-vote-button',
-  UPVOTE_BUTTON: 'cs-upvote-button',
-  DOWNVOTE_BUTTON: 'cs-downvote-button',
-  VOTE_BUTTON_ACTIVE: 'cs-vote-button-active',
 };
 
 /**

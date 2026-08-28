@@ -1,17 +1,7 @@
 /**
  * Utility functions for the Content Signing extension
  */
-import { sha256 } from 'js-sha256';
 import { ExtensionError } from './types';
-
-/**
- * Generates a hash of the provided content
- * @param content The content to hash
- * @returns The SHA-256 hash of the content
- */
-export function hashContent(content: string): string {
-  return sha256(content);
-}
 
 /**
  * Formats a timestamp as a human-readable date string
@@ -29,7 +19,7 @@ export function formatDate(timestamp: number): string {
  * @param details Additional error details
  * @returns An ExtensionError object
  */
-export function createError(code: string, message: string, details?: any): ExtensionError {
+export function createError(code: string, message: string, details?: unknown): ExtensionError {
   return {
     code,
     message,
@@ -46,7 +36,7 @@ export function isValidUrl(url: string): boolean {
   try {
     new URL(url);
     return true;
-  } catch (e) {
+  } catch {
     return false;
   }
 }
@@ -70,13 +60,13 @@ export function truncateString(str: string, maxLength: number): string {
  * @param wait The time to wait in milliseconds
  * @returns A debounced function
  */
-export function debounce<T extends (...args: any[]) => any>(
-  func: T,
+export function debounce<Args extends unknown[]>(
+  func: (...args: Args) => unknown,
   wait: number
-): (...args: Parameters<T>) => void {
+): (...args: Args) => void {
   let timeout: ReturnType<typeof setTimeout> | null = null;
   
-  return function(...args: Parameters<T>): void {
+  return function(...args: Args): void {
     const later = () => {
       timeout = null;
       func(...args);

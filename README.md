@@ -108,6 +108,12 @@ pending, so those builds do not claim working extension support in those
 browsers. For Chromium, open `chrome://extensions/`, enable Developer mode,
 choose **Load unpacked**, and select `build/chromium/`.
 
+Each production build enforces byte budgets for the shipped JavaScript:
+244 KiB each for `background.js` and `content.js`, 215 KiB for `popup.js`, and
+230 KiB for `options.js`. Unexpected JavaScript chunks fail the build because
+the manifests would not load them. After a Chromium build, rerun the gate
+alone with `npm run check:bundle`.
+
 ### Development
 
 ```sh
@@ -123,16 +129,19 @@ Use the matching `dev:firefox` or `dev:safari` command for another target. Reloa
 - `captureNavigationSnapshot` retains exact source slices, parser-owned elements, the final response URL, and the document base URL.
 - `mapSnapshotToLiveSections` pairs source sections with live elements by signed attributes, so page reordering does not pair one signature with another.
 - `observeSignedSection` watches only the live signed element. Mutations trigger re-verification against the immutable source section. History changes and replacement of signed sections trigger a fresh page refetch.
-- The content script inserts markers beside the outermost signed element. The marker, tooltip, and vote controls are outside signed content, including when sections are nested.
+- The content script inserts a marker beside the outermost signed element. The marker stays outside signed content, including when sections are nested.
 
 The popup receives copied result records. It cannot mutate the content script's verification cache.
+The content script is the only verification entry point. It sends an aggregate
+validity bit to the service worker after each page run or signed-content
+mutation; the service worker uses that result for the toolbar badge.
 
 ## Trust directory policy
 
 Open **Options**, add a directory, choose a weight from 0 to 1, and leave the
 subscription disabled until you want it consulted. The extension stores these
-rows in browser storage. Each enabled row is queried by the background or
-content verifier at `GET /signers/{id}/reputation`; the page marker and popup
+rows in browser storage. The content verifier queries each enabled row at
+`GET /signers/{id}/reputation`; the page marker and popup
 show cryptographic validity separately from the resulting directory trust.
 Only the signer identifier is sent to a configured HTTPS directory. Invalid
 URLs and weights are rejected before settings are saved. A timeout, malformed

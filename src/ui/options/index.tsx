@@ -99,7 +99,7 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
   }, [adapter]);
 
   // Handle setting change
-  const handleSettingChange = (key: keyof Settings, value: any) => {
+  const handleSettingChange = (key: keyof Settings, value: Settings[keyof Settings]) => {
     setState(prevState => ({
       ...prevState,
       settings: {

@@ -2,19 +2,10 @@
  * Background script entry point
  */
 import {
-  verifySignedSection,
-  evaluateTrustPolicy,
-  defaultResolverChain,
-  isPrivateHost,
-} from "@htmltrust/browser-client";
-import {
   Settings,
   VerificationResult,
   ServerConfig,
-  VoteType,
-  AuthorVote,
-  BatchedVotesPayload,
-  BatchVoteResult,
+  ClaimMap,
   getTrustDirectorySubscriptions,
   validateTrustDirectorySubscription,
   buildKeyidUrl,
@@ -26,13 +17,11 @@ import {
 import {
   STORAGE_KEYS,
   DEFAULT_SETTINGS,
-  MESSAGE_TYPES,
 } from "../core/common/constants";
 import { AuthService } from "../core/auth";
-import { ContentSigningClient } from "../core/api";
-import { ContentProcessor } from "../core/content";
-import { extractRawSignedSections } from "../core/content/navigation-lifecycle";
-import { PlatformAdapter, MessageContext } from "../platforms/common";
+import { extractSigningContent, hashSigningContent } from "../core/content/signing-extraction";
+import { PlatformAdapter, MessageContext, ExtensionMessage } from "../platforms/common";
+import { parseContentMessage, parseOptionsMessage, parsePopupMessage } from "./messages";
 
 // Import platform-specific adapter
 // This will be replaced with the correct adapter at build time
@@ -47,77 +36,13 @@ const authService = new AuthService({
   storage,
 });
 
-let contentProcessor: ContentProcessor;
 let settings: Settings = DEFAULT_SETTINGS;
-let contentSigningClient: ContentSigningClient | null = null;
+function assertNever(value: never): never {
+  throw new Error(`Unhandled message: ${String(value)}`);
+}
 
 function serializedOrigin(url: string): string {
   return new URL(url).origin;
-}
-
-function createVerifierFetch(): typeof fetch {
-  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.protocol !== "https:") {
-      throw new Error("network-policy-blocked: verifier key and directory fetches require HTTPS");
-    }
-    // An extension's fetch is not bound by page CORS, so a keyid pointing at
-    // loopback, link-local, or RFC 1918 space would reach hosts the page never
-    // could. Refuse those outright.
-    if (isPrivateHost(url.hostname)) {
-      throw new Error("network-policy-blocked: verifier fetches may not target private hosts");
-    }
-    return fetch(input, {
-      ...init,
-      credentials: "omit",
-      referrer: "",
-      referrerPolicy: "no-referrer",
-      redirect: "error",
-    });
-  };
-}
-
-type PristineSection = {
-  sectionHtml: string;
-  documentUrl: string;
-  baseUrl: string;
-};
-
-/** Fetch the response body so popup verification never signs live DOM HTML. */
-async function fetchPristineSection(url: string): Promise<PristineSection | null> {
-  const requested = new URL(url);
-  if (requested.protocol !== 'https:') return null;
-  const response = await fetch(requested.href, {
-    cache: 'force-cache',
-    credentials: 'include',
-    referrer: '',
-    referrerPolicy: 'no-referrer',
-    redirect: 'error',
-  });
-  if (!response.ok) return null;
-  const documentUrl = response.url || requested.href;
-  const finalUrl = new URL(documentUrl);
-  if (finalUrl.protocol !== 'https:' || finalUrl.origin !== requested.origin) return null;
-  const html = await response.text();
-  const sectionHtml = extractRawSignedSections(html)[0];
-  if (!sectionHtml) return null;
-
-  // Service workers do not expose DOMParser in every target. The response URL
-  // remains the correct base when no document <base> can be parsed here; the
-  // content-script path computes a parser-backed base for normal page loads.
-  let baseUrl = documentUrl;
-  if (typeof DOMParser !== 'undefined') {
-    const parsed = new DOMParser().parseFromString(html, 'text/html');
-    const base = parsed.querySelector('base[href]');
-    if (base) {
-      try {
-        baseUrl = new URL(base.getAttribute('href') ?? '', documentUrl).href;
-      } catch {
-        baseUrl = documentUrl;
-      }
-    }
-  }
-  return { sectionHtml, documentUrl, baseUrl };
 }
 
 /**
@@ -129,9 +54,6 @@ async function initialize() {
     const storedSettings = await storage.get<Settings>(STORAGE_KEYS.SETTINGS);
     settings = storedSettings || DEFAULT_SETTINGS;
 
-    // Initialize the content processor
-    contentProcessor = new ContentProcessor();
-
     // Initialize the auth service
     await authService.initialize();
 
@@ -141,10 +63,6 @@ async function initialize() {
     // Set up badge
     updateBadge();
 
-    // Set up alarm for periodic vote submission
-    setupVoteSubmissionAlarm();
-
-    console.log("Content Signing background script initialized");
   } catch (error) {
     console.error("Failed to initialize background script:", error);
   }
@@ -166,39 +84,36 @@ function registerMessageListeners() {
  * @param message The message to handle
  * @returns A promise that resolves with the response
  */
-async function handlePopupMessage(message: any): Promise<any> {
-  switch (message.type) {
-    case "GET_VERIFICATION_STATUS":
-      return getVerificationStatus(message.url);
-    case "VERIFY_CONTENT":
-      return verifyContent(message.url);
+async function handlePopupMessage(message: ExtensionMessage): Promise<unknown> {
+  const parsed = parsePopupMessage(message);
+  switch (parsed.type) {
     case "SIGN_CONTENT":
-      return signContent(message.url, message.claims);
+      return signContent(parsed.url, parsed.claims);
     case "CREATE_AUTHOR":
       return createAuthor(
-        message.name,
-        message.keyType,
-        message.description,
-        message.url,
+        parsed.name,
+        parsed.keyType,
+        parsed.description,
+        parsed.url,
       );
     case "ASSOCIATE_API_KEY":
-      return associateApiKey(message.authorId, message.apiKey);
+      return associateApiKey(parsed.authorId, parsed.apiKey);
     case "SIGN_OUT":
       return signOut();
     case "GET_ACTIVE_SERVER":
       return getActiveServer();
     case "SET_ACTIVE_SERVER":
-      return setActiveServer(message.serverId);
+      return setActiveServer(parsed.serverId);
     case "GET_ALL_SERVERS":
       return getAllServers();
     case "ADD_SERVER":
-      return addServer(message.name, message.url, message.setAsActive);
+      return addServer(parsed.name, parsed.url, parsed.setAsActive);
     case "UPDATE_SERVER":
-      return updateServer(message.id, message.updates);
+      return updateServer(parsed.id, parsed.updates);
     case "REMOVE_SERVER":
-      return removeServer(message.id);
+      return removeServer(parsed.id);
     default:
-      throw new Error(`Unknown message type: ${message.type}`);
+      return assertNever(parsed);
   }
 }
 
@@ -207,22 +122,9 @@ async function handlePopupMessage(message: any): Promise<any> {
  * @param message The message to handle
  * @returns A promise that resolves with the response
  */
-async function handleContentMessage(message: any): Promise<any> {
-  switch (message.type) {
-    case MESSAGE_TYPES.CONTENT_DETECTED:
-      return handleContentDetected(message.url, message.content);
-    case MESSAGE_TYPES.SUBMIT_VOTE:
-      return handleVoteSubmission(
-        message.authorId,
-        message.vote,
-        message.url,
-        message.contentHash,
-      );
-    case "GET_AUTHOR_VOTE":
-      return getAuthorVote(message.authorId);
-    default:
-      throw new Error(`Unknown message type: ${message.type}`);
-  }
+async function handleContentMessage(message: ExtensionMessage): Promise<unknown> {
+  const parsed = parseContentMessage(message);
+  return handleContentDetected(parsed.url, parsed.verified);
 }
 
 /**
@@ -230,13 +132,9 @@ async function handleContentMessage(message: any): Promise<any> {
  * @param message The message to handle
  * @returns A promise that resolves with the response
  */
-async function handleOptionsMessage(message: any): Promise<any> {
-  switch (message.type) {
-    case "UPDATE_SETTINGS":
-      return updateSettings(message.settings);
-    default:
-      throw new Error(`Unknown message type: ${message.type}`);
-  }
+async function handleOptionsMessage(message: ExtensionMessage): Promise<unknown> {
+  const parsed = parseOptionsMessage(message);
+  return updateSettings(parsed.settings);
 }
 
 /**
@@ -244,7 +142,7 @@ async function handleOptionsMessage(message: any): Promise<any> {
  * @param url The URL to get the verification status for
  * @returns The verification status
  */
-async function getVerificationStatus(url: string): Promise<any> {
+async function getVerificationStatus(url: string) {
   try {
     // Check if we have a cached verification result
     const verificationResults =
@@ -277,152 +175,6 @@ async function getVerificationStatus(url: string): Promise<any> {
 }
 
 /**
- * Verify content at a URL.
- *
- * This is the popup-driven verification path: when the user clicks
- * "Verify Content" in the popup, the popup messages this function. We do
- * the crypto step locally in the page context (where SubtleCrypto is
- * available on a secure origin) using @htmltrust/browser-client, and
- * cache the result so the popup can display it.
- *
- * The trust server is NOT contacted for verification (the deprecated
- * /api/content/verify endpoint has been removed). Author lookup for the
- * "verified by ..." display is best-effort and falls back to the keyid.
- *
- * The auto-verify content script (content-scripts/index.ts) renders inline
- * badges on page load without involving this function; that path is
- * preferred for normal browsing. This function exists for the popup's
- * explicit on-demand verify and as the source of truth for the cached
- * VerificationResult that the popup reads via GET_VERIFICATION_STATUS.
- */
-async function verifyContent(url: string): Promise<any> {
-  try {
-    // Step 1: fetch the response body. DOM outerHTML is a repaired
-    // serialization and cannot preserve source-level parser ambiguities.
-    const pristine = await fetchPristineSection(url);
-
-    let verificationResult: VerificationResult;
-
-    if (!pristine) {
-      verificationResult = {
-        verified: false,
-        cryptoValid: false,
-        reason: "No signed-section found on this page",
-        verifiedAt: Date.now(),
-        domain: serializedOrigin(url),
-        trustStatus: "unknown",
-      };
-    } else {
-      // Step 2: verify locally (Layer 1, spec §3.1). We run in the
-      // background service worker context, which has SubtleCrypto. The
-      // resolver chain is built from the user's configured directory list;
-      // empty list still works for did:web and direct-URL keyids.
-      const directories = getTrustDirectorySubscriptions(settings)
-        .filter((subscription) => subscription.enabled && !validateTrustDirectorySubscription(subscription))
-        .map((subscription) => subscription.url);
-      const resolverChain = defaultResolverChain({
-        directories,
-        fetch: createVerifierFetch(),
-      });
-
-      const verify = await verifySignedSection(pristine.sectionHtml, {
-        keyResolvers: resolverChain,
-        domain: serializedOrigin(pristine.documentUrl),
-        origin: serializedOrigin(pristine.documentUrl),
-        documentUrl: pristine.documentUrl,
-        baseUrl: pristine.baseUrl,
-        debug: settings.developerDebugLogging === true,
-      } as Parameters<typeof verifySignedSection>[1]);
-
-      // Best-effort author name lookup. The author DB is server-side and
-      // optional; if we can't fetch it (the keyid isn't a server URL or
-      // the server is unreachable) the verified state still holds — we
-      // just show the keyid in place of a friendly name.
-      const keyid = verify.keyid || "";
-      const authorIdMatch = keyid.match(/\/authors\/([^/]+)/);
-      const authorId = authorIdMatch ? authorIdMatch[1] : null;
-
-      if (verify.valid) {
-        let userName = keyid || "unknown";
-        let userId = authorId || keyid;
-        if (authorId) {
-          try {
-            const csClient = authService.getContentSigningClient();
-            if (csClient) {
-              const author = await csClient.getAuthor(authorId);
-              userName = author.name;
-              userId = author.id;
-            }
-          } catch {
-            // Author lookup failed; not fatal. Verification status is unaffected.
-          }
-        }
-
-        const trust = await evaluateTrustPolicy(verify, {
-          personalTrustList: settings.personalTrustList ?? [],
-          trustedDomains: settings.trustedDomains ?? [],
-          directorySubscriptions: getTrustDirectorySubscriptions(settings),
-          fetch: createVerifierFetch(),
-        });
-        verificationResult = {
-          verified: true,
-          cryptoValid: true,
-          verifiedAt: Date.now(),
-          domain: serializedOrigin(url),
-          user: {
-            id: userId,
-            name: userName,
-            email: "",
-            publicKey: "",
-            verified: true,
-          },
-          trustStatus: trust.indicator === "green" ? "trusted" : trust.indicator === "red" ? "untrusted" : "unknown",
-          trustScore: trust.score,
-          trustIndicator: trust.indicator,
-          trustInputs: trust.inputs,
-        };
-      } else {
-        verificationResult = {
-          verified: false,
-          cryptoValid: false,
-          reason: verify.reason || "Signature verification failed",
-          verifiedAt: Date.now(),
-          domain: serializedOrigin(url),
-          trustStatus: "untrusted",
-          trustScore: 0,
-          trustIndicator: "red",
-        };
-      }
-    }
-
-    // Cache the verification result
-    const verificationResults =
-      (await storage.get<Record<string, VerificationResult>>(
-        STORAGE_KEYS.VERIFICATION_RESULTS,
-      )) || {};
-    verificationResults[url] = verificationResult;
-    await storage.set(STORAGE_KEYS.VERIFICATION_RESULTS, verificationResults);
-
-    updateBadge();
-
-    return {
-      verified: verificationResult.verified,
-      status: verificationResult.verified
-        ? "Verified"
-        : verificationResult.reason || "Not verified",
-      result: verificationResult,
-    };
-  } catch (error) {
-    console.error("Failed to verify content:", error);
-    return {
-      verified: false,
-      status: "Error: " + (error as Error).message,
-      result: null,
-    };
-  }
-}
-
-/**
  * Sign content at a URL
  * @param url The URL to sign content at
  * @param claims Optional claims about the content
@@ -430,8 +182,8 @@ async function verifyContent(url: string): Promise<any> {
  */
 async function signContent(
   url: string,
-  claims: Record<string, any> = {},
-): Promise<any> {
+  claims: ClaimMap = {},
+) {
   try {
     // Check if the user is authenticated
     if (!authService.isAuthenticated()) {
@@ -441,16 +193,15 @@ async function signContent(
     // Get the current tab
     const currentTab = await platformAdapter.getCurrentTab();
 
-    // Execute a script to extract the content
-    const extractedContent = await platformAdapter.executeScript<any>(
+    // Extract in the page, then normalize and hash in the extension service
+    // worker. Passing a function avoids interpolating page-controlled data
+    // into executable source.
+    const extractedContent = await platformAdapter.executeFunction(
       currentTab.id,
-      `
-      (() => {
-        const contentProcessor = new ContentProcessor();
-        return contentProcessor.extractContent(document);
-      })()
-    `,
+      extractSigningContent,
+      [],
     );
+    const contentHash = await hashSigningContent(extractedContent.content);
 
     // Get the Content Signing client
     const contentSigningClient = authService.getContentSigningClient();
@@ -459,32 +210,15 @@ async function signContent(
     }
 
     // If no claims provided, use some defaults based on extracted metadata
-    if (Object.keys(claims).length === 0 && extractedContent.metadata) {
+    if (Object.keys(claims).length === 0) {
       claims = {
         title: extractedContent.title,
       };
-
-      // Add Dublin Core metadata if available
-      if (extractedContent.structuredMetadata?.dublinCore) {
-        const dc = extractedContent.structuredMetadata.dublinCore;
-        if (dc.creator) claims.creator = dc.creator;
-        if (dc.description) claims.description = dc.description;
-        if (dc.subject) claims.subject = dc.subject;
-        if (dc.type) claims.contentType = dc.type;
-      }
-
-      // Add Schema.org metadata if available
-      if (extractedContent.structuredMetadata?.schemaOrg) {
-        const schema = extractedContent.structuredMetadata.schemaOrg;
-        if (schema.datePublished) claims.datePublished = schema.datePublished;
-        if (schema.dateModified) claims.dateModified = schema.dateModified;
-        if (schema.author?.name) claims.author = schema.author.name;
-      }
     }
 
     // Sign the content
     const signature = await contentSigningClient.signContent(
-      extractedContent.contentHash,
+      contentHash,
       serializedOrigin(url),
       claims,
     );
@@ -611,7 +345,7 @@ async function createAuthor(
   keyType: "HUMAN" | "AI" | "HUMAN_AI_MIX" | "ORGANIZATION",
   description?: string,
   url?: string,
-): Promise<any> {
+) {
   try {
     const author = await authService.createAuthor(
       name,
@@ -638,7 +372,7 @@ async function createAuthor(
  * @param apiKey The API key to associate
  * @returns A promise that resolves with the author details
  */
-async function associateApiKey(authorId: string, apiKey: string): Promise<any> {
+async function associateApiKey(authorId: string, apiKey: string) {
   try {
     const author = await authService.associateApiKey(authorId, apiKey);
     return {
@@ -658,7 +392,7 @@ async function associateApiKey(authorId: string, apiKey: string): Promise<any> {
  * Sign out the current user
  * @returns A promise that resolves when the user is signed out
  */
-async function signOut(): Promise<any> {
+async function signOut() {
   try {
     await authService.signOut();
     return {
@@ -677,7 +411,7 @@ async function signOut(): Promise<any> {
  * Get the active server configuration
  * @returns The active server configuration
  */
-async function getActiveServer(): Promise<any> {
+async function getActiveServer() {
   try {
     const activeServer = authService.getActiveServerConfig();
     return {
@@ -698,7 +432,7 @@ async function getActiveServer(): Promise<any> {
  * @param serverId The ID of the server configuration to set as active
  * @returns A promise that resolves when the active server is set
  */
-async function setActiveServer(serverId: string): Promise<any> {
+async function setActiveServer(serverId: string) {
   try {
     await authService.setActiveServer(serverId);
     return {
@@ -717,7 +451,7 @@ async function setActiveServer(serverId: string): Promise<any> {
  * Get all server configurations
  * @returns An array of all server configurations
  */
-async function getAllServers(): Promise<any> {
+async function getAllServers() {
   try {
     const servers = authService.getAllServerConfigs();
     return {
@@ -744,7 +478,7 @@ async function addServer(
   name: string,
   url: string,
   setAsActive = false,
-): Promise<any> {
+) {
   try {
     const serverId = await authService.addServerConfig(name, url, setAsActive);
     return {
@@ -769,7 +503,7 @@ async function addServer(
 async function updateServer(
   id: string,
   updates: Partial<Omit<ServerConfig, "id">>,
-): Promise<any> {
+) {
   try {
     await authService.updateServerConfig(id, updates);
     return {
@@ -789,7 +523,7 @@ async function updateServer(
  * @param id The ID of the server configuration to remove
  * @returns A promise that resolves when the server configuration is removed
  */
-async function removeServer(id: string): Promise<any> {
+async function removeServer(id: string) {
   try {
     await authService.removeServerConfig(id);
     return {
@@ -831,22 +565,40 @@ async function updateSettings(newSettings: Settings): Promise<void> {
 }
 
 /**
- * Handle content detected
- * @param url The URL where content was detected
- * @param content The detected content
- * @returns A promise that resolves with the verification result
+ * Cache the aggregate produced by the content script's source-based verifier.
+ * Keeping one verifier avoids loading the canonicalizer and resolver stack in
+ * both extension entry points.
  */
-async function handleContentDetected(url: string, content: any): Promise<any> {
+async function handleContentDetected(
+  url: string,
+  verified = false,
+) {
   try {
-    // If auto-verify is enabled, verify the content
-    if (settings.autoVerify) {
-      return verifyContent(url);
-    }
+    const isVerified = settings.autoVerify && verified;
+    const verificationResult: VerificationResult = {
+      verified: isVerified,
+      cryptoValid: isVerified,
+      reason: isVerified
+        ? undefined
+        : settings.autoVerify
+          ? "No verified signed sections"
+          : "Auto-verification disabled",
+      verifiedAt: Date.now(),
+      domain: serializedOrigin(url),
+      trustStatus: "unknown",
+    };
+    const verificationResults =
+      (await storage.get<Record<string, VerificationResult>>(
+        STORAGE_KEYS.VERIFICATION_RESULTS,
+      )) || {};
+    verificationResults[url] = verificationResult;
+    await storage.set(STORAGE_KEYS.VERIFICATION_RESULTS, verificationResults);
+    await updateBadge();
 
     return {
-      verified: false,
-      status: "Auto-verification disabled",
-      result: null,
+      verified: isVerified,
+      status: isVerified ? "Verified" : verificationResult.reason,
+      result: verificationResult,
     };
   } catch (error) {
     console.error("Failed to handle content detected:", error);
@@ -880,158 +632,6 @@ async function updateBadge(): Promise<void> {
     }
   } catch (error) {
     console.error("Failed to update badge:", error);
-  }
-}
-
-/**
- * Set up the alarm for periodic vote submission
- */
-function setupVoteSubmissionAlarm(): void {
-  // Clear any existing alarms
-  chrome.alarms.clear("syncVotesAlarm");
-
-  // Create a new alarm that fires every 5 minutes
-  chrome.alarms.create("syncVotesAlarm", {
-    periodInMinutes: 5,
-  });
-
-  // Add an alarm listener
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === "syncVotesAlarm") {
-      submitPendingVotes();
-    }
-  });
-
-  // Also trigger on browser startup
-  chrome.runtime.onStartup.addListener(() => {
-    submitPendingVotes();
-  });
-}
-
-/**
- * Handle vote submission from content script
- * @param authorId The ID of the author to vote on
- * @param vote The type of vote to cast
- * @param url Optional URL where the vote was cast
- * @param contentHash Optional content hash where the vote was cast
- * @returns A promise that resolves with the result
- */
-async function handleVoteSubmission(
-  authorId: string,
-  vote: VoteType,
-  url?: string,
-  contentHash?: string,
-): Promise<any> {
-  try {
-    // Create the vote object
-    const authorVote: AuthorVote = {
-      authorId,
-      vote,
-      timestamp: Date.now(),
-      url,
-      contentHash,
-    };
-
-    // Update local state based on vote type
-    if (vote === VoteType.NEUTRAL) {
-      // Remove the vote if it's neutral (retraction)
-      await storage.remove(`${STORAGE_KEYS.AUTHOR_VOTES}:${authorId}`);
-    } else {
-      // Store the vote
-      await storage.set(`${STORAGE_KEYS.AUTHOR_VOTES}:${authorId}`, authorVote);
-    }
-
-    // Add to pending votes queue
-    const pendingVotes =
-      (await storage.get<BatchedVotesPayload>(STORAGE_KEYS.PENDING_VOTES)) ||
-      {};
-    pendingVotes[authorId] = vote;
-    await storage.set(STORAGE_KEYS.PENDING_VOTES, pendingVotes);
-
-    // Send acknowledgment back to content script
-    platformAdapter.sendMessage(MessageContext.CONTENT, {
-      type: MESSAGE_TYPES.VOTE_ACKNOWLEDGED,
-      authorId,
-      success: true,
-    });
-
-    return { success: true };
-  } catch (error) {
-    console.error("Failed to handle vote submission:", error);
-    return {
-      success: false,
-      error: (error as Error).message,
-    };
-  }
-}
-
-/**
- * Get the current vote for an author
- * @param authorId The ID of the author
- * @returns A promise that resolves with the vote
- */
-async function getAuthorVote(authorId: string): Promise<any> {
-  try {
-    const vote = await storage.get<AuthorVote>(
-      `${STORAGE_KEYS.AUTHOR_VOTES}:${authorId}`,
-    );
-    return { vote: vote?.vote || null };
-  } catch (error) {
-    console.error("Failed to get author vote:", error);
-    return { vote: null };
-  }
-}
-
-/**
- * Submit pending votes to the server
- * @returns A promise that resolves when the votes are submitted
- */
-async function submitPendingVotes(): Promise<void> {
-  try {
-    // Get the pending votes
-    const pendingVotes = await storage.get<BatchedVotesPayload>(
-      STORAGE_KEYS.PENDING_VOTES,
-    );
-
-    // If there are no pending votes, return
-    if (!pendingVotes || Object.keys(pendingVotes).length === 0) {
-      return;
-    }
-
-    // Get the Content Signing client
-    if (!contentSigningClient) {
-      contentSigningClient = authService.getContentSigningClient();
-    }
-
-    if (!contentSigningClient) {
-      console.error("Content Signing client not initialized");
-      return;
-    }
-
-    // Submit the votes
-    const result = await contentSigningClient.submitBatchedVotes(pendingVotes);
-
-    // If successful, clear the pending votes
-    if (result.success) {
-      await storage.set(STORAGE_KEYS.PENDING_VOTES, {});
-      console.log("Successfully submitted pending votes");
-    } else if (result.results) {
-      // Handle partial success - remove successful votes from pending
-      const updatedPendingVotes: BatchedVotesPayload = {};
-
-      for (const [authorId, vote] of Object.entries(pendingVotes)) {
-        const voteResult = result.results[authorId];
-        if (!voteResult || !voteResult.success) {
-          // Keep votes that failed in the pending queue
-          updatedPendingVotes[authorId] = vote;
-        }
-      }
-
-      await storage.set(STORAGE_KEYS.PENDING_VOTES, updatedPendingVotes);
-      console.log("Partially submitted pending votes");
-    }
-  } catch (error) {
-    console.error("Failed to submit pending votes:", error);
   }
 }
 

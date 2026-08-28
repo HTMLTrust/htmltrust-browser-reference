@@ -1,10 +1,16 @@
 /**
  * Trust Directory API client
  */
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import { TrustDirectoryEntry, User, VerificationResult } from '../common/types';
 import { ERROR_CODES } from '../common/constants';
 import { createError } from '../common/utils';
+import { JsonHttpClient, JsonHttpError } from './json-http-client';
+import {
+  isTrustDirectoryEntry,
+  isTrustDirectoryEntryList,
+  isUser,
+  isVerificationResult,
+} from './response-validation';
 
 /**
  * Trust Directory API client options
@@ -22,32 +28,17 @@ export interface TrustDirectoryClientOptions {
  * Trust Directory API client
  */
 export class TrustDirectoryClient {
-  private client: AxiosInstance;
-  private baseUrl: string;
+  private client: JsonHttpClient;
 
   /**
    * Create a new Trust Directory API client
    * @param options The client options
    */
   constructor(options: TrustDirectoryClientOptions) {
-    this.baseUrl = options.baseUrl;
-    
-    const config: AxiosRequestConfig = {
-      baseURL: options.baseUrl,
-      timeout: options.timeout || 10000,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    };
-
+    this.client = new JsonHttpClient(options.baseUrl, options.timeout ?? 10_000);
     if (options.apiKey) {
-      config.headers = {
-        ...config.headers,
-        'Authorization': `Bearer ${options.apiKey}`,
-      };
+      this.client.setHeader('Authorization', `Bearer ${options.apiKey}`);
     }
-
-    this.client = axios.create(config);
   }
 
   /**
@@ -56,7 +47,7 @@ export class TrustDirectoryClient {
    */
   async getAllEntries(): Promise<TrustDirectoryEntry[]> {
     try {
-      const response = await this.client.get('/api/v1/trust-directory');
+      const response = await this.client.get('/api/v1/trust-directory', undefined, isTrustDirectoryEntryList);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, 'Failed to get trust directory entries');
@@ -70,7 +61,7 @@ export class TrustDirectoryClient {
    */
   async getEntryById(id: string): Promise<TrustDirectoryEntry> {
     try {
-      const response = await this.client.get(`/api/v1/trust-directory/${id}`);
+      const response = await this.client.get(`/api/v1/trust-directory/${id}`, undefined, isTrustDirectoryEntry);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, `Failed to get trust directory entry with ID ${id}`);
@@ -84,7 +75,7 @@ export class TrustDirectoryClient {
    */
   async getEntriesByDomain(domain: string): Promise<TrustDirectoryEntry[]> {
     try {
-      const response = await this.client.get(`/api/v1/trust-directory/domain/${domain}`);
+      const response = await this.client.get(`/api/v1/trust-directory/domain/${domain}`, undefined, isTrustDirectoryEntryList);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, `Failed to get trust directory entries for domain ${domain}`);
@@ -98,7 +89,7 @@ export class TrustDirectoryClient {
    */
   async getEntriesByUser(userId: string): Promise<TrustDirectoryEntry[]> {
     try {
-      const response = await this.client.get(`/api/v1/trust-directory/user/${userId}`);
+      const response = await this.client.get(`/api/v1/trust-directory/user/${userId}`, undefined, isTrustDirectoryEntryList);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, `Failed to get trust directory entries for user ${userId}`);
@@ -112,7 +103,7 @@ export class TrustDirectoryClient {
    */
   async createEntry(entry: Omit<TrustDirectoryEntry, 'id' | 'createdAt' | 'updatedAt'>): Promise<TrustDirectoryEntry> {
     try {
-      const response = await this.client.post('/api/v1/trust-directory', entry);
+      const response = await this.client.post('/api/v1/trust-directory', entry, isTrustDirectoryEntry);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, 'Failed to create trust directory entry');
@@ -127,7 +118,7 @@ export class TrustDirectoryClient {
    */
   async updateEntry(id: string, entry: Partial<TrustDirectoryEntry>): Promise<TrustDirectoryEntry> {
     try {
-      const response = await this.client.put(`/api/v1/trust-directory/${id}`, entry);
+      const response = await this.client.put(`/api/v1/trust-directory/${id}`, entry, isTrustDirectoryEntry);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, `Failed to update trust directory entry with ID ${id}`);
@@ -167,7 +158,7 @@ export class TrustDirectoryClient {
         contentHash,
         signature,
         publicKey,
-      });
+      }, isVerificationResult);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, 'Failed to verify signature');
@@ -181,7 +172,7 @@ export class TrustDirectoryClient {
    */
   async getUserById(id: string): Promise<User> {
     try {
-      const response = await this.client.get(`/api/v1/users/${id}`);
+      const response = await this.client.get(`/api/v1/users/${id}`, undefined, isUser);
       return response.data;
     } catch (error) {
       throw this.handleApiError(error, `Failed to get user with ID ${id}`);
@@ -194,10 +185,10 @@ export class TrustDirectoryClient {
    * @param defaultMessage The default error message
    * @returns A standardized error object
    */
-  private handleApiError(error: any, defaultMessage: string): never {
-    if (axios.isAxiosError(error)) {
-      const status = error.response?.status;
-      const message = error.response?.data?.message || error.message || defaultMessage;
+  private handleApiError(error: unknown, defaultMessage: string): never {
+    if (error instanceof JsonHttpError) {
+      const status = error.status;
+      const message = error.message || defaultMessage;
       
       if (status === 401 || status === 403) {
         throw createError(ERROR_CODES.AUTH_ERROR, message, error);

@@ -8,7 +8,7 @@ import { BaseStorage } from './storage-interface';
  * This is primarily used for testing and development
  */
 export class MemoryStorage extends BaseStorage {
-  private storage: Map<string, any> = new Map();
+  private storage: Map<string, unknown> = new Map();
 
   /**
    * Get a value from storage

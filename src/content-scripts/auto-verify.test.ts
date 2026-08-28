@@ -20,14 +20,6 @@ jest.mock('@htmltrust/browser-client', () => ({
   isPrivateHost: jest.fn((hostname: string) => hostname === '127.0.0.1' || hostname === 'localhost'),
 }));
 
-// The legacy content-extraction path is outside these lifecycle tests. Mocking
-// only that leaf avoids pulling the browser-client's ESM canonicalizer into
-// Jest while leaving navigation-lifecycle.ts and index.ts production code
-// intact.
-jest.mock('../core/content/content-processor', () => ({
-  ContentProcessor: jest.fn().mockImplementation(() => ({ extractContent: jest.fn() })),
-}));
-
 import {
   evaluateTrustPolicy,
   verifySignedSection,
@@ -37,7 +29,6 @@ const {
   applySectionStatusUI,
   armSectionMutationInvalidation,
   autoVerifyPage,
-  buildAutoBadges,
   invalidateAutoVerifyGeneration,
   resetNavigationState,
 } = require('./index') as typeof import('./index');
@@ -280,11 +271,5 @@ describe('production content-script UI and lifecycle', () => {
       await expect(policy.fetch('http://private.example/')).rejects.toThrow('network-policy-blocked');
       await expect(policy.fetch('https://127.0.0.1/')).rejects.toThrow('network-policy-blocked');
     }
-  });
-
-  it('keeps the production auto badge builder warning-aware', () => {
-    const warning = buildAutoBadges(verifyShape({ inputState: 'stale' }), trustShape());
-    expect(warning.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`)).not.toBeNull();
-    expect(warning.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).toBeNull();
   });
 });

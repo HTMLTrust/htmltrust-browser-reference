@@ -106,6 +106,9 @@ export interface Claim {
 /**
  * Represents a content signature in the Content Signing API
  */
+export type ClaimValue = string | number | boolean;
+export type ClaimMap = Record<string, ClaimValue>;
+
 export interface ContentSignature {
   /** Hash of the normalized content */
   contentHash: string;
@@ -116,7 +119,7 @@ export interface ContentSignature {
   /** Cryptographic signature binding content, hash, domain, and author key */
   signature: string;
   /** Claims about the content */
-  claims: Record<string, any>;
+  claims: ClaimMap;
   /** Creation timestamp */
   createdAt?: string;
 }
@@ -379,7 +382,7 @@ export interface ExtensionError {
   /** The error message */
   message: string;
   /** The error details */
-  details?: any;
+  details?: unknown;
 }
 
 /**

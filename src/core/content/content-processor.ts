@@ -1,7 +1,7 @@
 /**
  * Content processing utilities for DOM normalization and hashing
  */
-import { hashContent } from '../common/utils';
+import { hashContent } from '../common/hash';
 import { normalizeText } from '@htmltrust/canonicalization';
 import * as simhash from 'simhash-js';
 

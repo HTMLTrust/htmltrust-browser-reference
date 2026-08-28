@@ -26,7 +26,7 @@
       "css": ["assets/content.css"]
     }
   ],
-  "permissions": ["storage", "tabs", "notifications", "alarms", "scripting"],
+  "permissions": ["storage", "tabs", "notifications", "scripting"],
   "host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
   "options_ui": {
     "page": "options.html",
