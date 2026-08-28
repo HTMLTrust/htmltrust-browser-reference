@@ -30,8 +30,8 @@ After each page load or same-document navigation, the content script refetches t
 - Chromium, Firefox, or Safari for loading a built extension
 
 The published dependencies pin browser client commit
-`e7cf034bc696f78f22707823001af5d9d8ba7541` and canonicalization commit
-`5e51040dcaaf50935e245702bdefbc18a1d542ce`. These are the revisions recorded
+`70c5ddb6ed23c06c0b1c46d5284618fb99a28aac` and canonicalization commit
+`760593d4a02e9fffa56dc4d002eb52ab2ade1b49`. These are the revisions recorded
 in `package.json` and `package-lock.json`; update both files together when the
 release revision changes. A sibling browser-client checkout is optional. Use
 one when developing both repositories together.
