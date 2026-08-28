@@ -22,7 +22,7 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependency is pinned to browser-client commit `698a6fba7ada94ea1e26348dda0e1c87e8dd8fc9`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependency is pinned to browser-client commit `a846e3d971ab93bdcc8a9f599fb1987828344983`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
 
 For a standalone checkout:
 
@@ -67,7 +67,7 @@ container with:
 ```
 
 The script copies this checkout into the container, installs the pinned browser
-client from Git, runs 60 extension tests, checks types and lint, then builds all
+client from Git, runs 63 extension tests, checks types and lint, then builds all
 three browser packages. Generated files stay outside the checkout.
 
 ### Build

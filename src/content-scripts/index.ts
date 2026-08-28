@@ -5,7 +5,7 @@
  *
  *   1. Auto-verify on page load. On DOMContentLoaded (the manifest registers
  *      this script as document_idle equivalent for content_scripts), find
- *      every <signed-section[signature]> on the page, verify each via
+ *      every <signed-section> on the page, verify each via
  *      @htmltrust/browser-client (Layer 1, SubtleCrypto-backed), evaluate the
  *      trust policy locally (Layer 2), and inject the corresponding status
  *      marker beside each section. No popup interaction required.
@@ -33,9 +33,14 @@ import { MESSAGE_TYPES, CSS_CLASSES, TRUST_STATUS, STORAGE_KEYS } from '../core/
 import { ContentProcessor } from '../core/content';
 import {
   captureNavigationSnapshot,
+  documentBaseUrl,
   mapSnapshotToLiveSections,
+  mutationTouchesDocumentBase,
+  observeDocumentBase,
   observeSignedSection,
+  outermostSignedSection,
   SIGNED_SECTION_SELECTOR,
+  sourceElementForSnapshot,
   type NavigationSnapshot,
 } from '../core/content/navigation-lifecycle';
 import { PlatformAdapter, MessageContext } from '../platforms/common';
@@ -99,6 +104,7 @@ type SectionVerificationRun = {
 const pageVerifications: PageVerification[] = [];
 const pageVerificationBySection = new WeakMap<Element, PageVerification>();
 const sectionObserverDisposers = new WeakMap<Element, () => void>();
+const sectionMarkers = new WeakMap<Element, HTMLElement>();
 let navigationSnapshot: NavigationSnapshot | null = null;
 let observedSections = new Set<Element>();
 let rerenderObserver: MutationObserver | null = null;
@@ -107,6 +113,7 @@ let rerenderTimer: ReturnType<typeof setTimeout> | null = null;
 let navigationPollTimer: ReturnType<typeof setInterval> | null = null;
 let lastObservedUrl = '';
 let lifecycleInstalled = false;
+let baseObserverDisposer: (() => void) | null = null;
 const sectionReverifyGeneration = new WeakMap<Element, number>();
 
 /**
@@ -284,7 +291,11 @@ function installNavigationLifecycle(): void {
       return result;
     };
   }
-  rerenderObserver = new MutationObserver(() => {
+  rerenderObserver = new MutationObserver((mutations) => {
+    if (mutations.some(mutationTouchesDocumentBase)) {
+      notify();
+      return;
+    }
     const current = new Set(document.querySelectorAll(SIGNED_SECTION_SELECTOR));
     if (current.size !== observedSections.size || [...current].some((section) => !observedSections.has(section))) {
       notify();
@@ -293,6 +304,7 @@ function installNavigationLifecycle(): void {
   if (document.documentElement) {
     rerenderObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
+  baseObserverDisposer = observeDocumentBase(document, notify);
   // Extension content scripts run in an isolated JavaScript world in Chromium.
   // A page-world pushState call may bypass the wrapper above, so compare the
   // shared location on a short interval as a cross-browser fallback.
@@ -305,6 +317,8 @@ function installNavigationLifecycle(): void {
       navigationPollTimer = null;
     }
     rerenderObserver?.disconnect();
+    baseObserverDisposer?.();
+    baseObserverDisposer = null;
     observedSections.forEach((section) => sectionObserverDisposers.get(section)?.());
   }, { once: true });
 }
@@ -342,6 +356,12 @@ async function loadSettings(): Promise<Settings> {
 
 function currentOrigin(): string {
   return window.location.origin;
+}
+
+function sourceFailureReason(error: string | null): VerifyResult['reason'] {
+  return error?.startsWith('network-policy-blocked')
+    ? 'network-policy-blocked'
+    : 'source-refetch-failed';
 }
 
 function redactForLog(value: unknown): unknown {
@@ -427,9 +447,11 @@ async function fetchPristineSignedSections(settings: Settings): Promise<{
 
 async function verifySectionWithState(
   section: Element,
-  sourceSlice: string | null,
+  sourceElement: Element | null,
+  sourceBaseUrl: string | null,
   resolverChain: KeyResolver[],
   settings: Settings,
+  sourceFailure?: VerifyResult['reason'] | null,
 ): Promise<SectionVerificationRun> {
   const origin = currentOrigin();
   const options = {
@@ -440,23 +462,39 @@ async function verifySectionWithState(
     debug: settings.developerDebugLogging === true,
   };
 
-  if (!sourceSlice) {
-    const verify = await verifySignedSection(section, options);
-    const inputState = verify.inputState as VerificationInputState;
+  if (!sourceElement) {
+    // A live DOM is not an accepted Layer-1 source. Page script can construct
+    // or rewrite it after navigation, so treating it as verified would make a
+    // valid indicator attacker-controlled.
+    const verify: VerifyResult = {
+      valid: false,
+      keyid: section.getAttribute('keyid') ?? '',
+      algorithm: section.getAttribute('algorithm') ?? '',
+      contentHash: section.getAttribute('content-hash') ?? '',
+      claimsHash: '',
+      claims: {},
+      signedAt: '',
+      domain: origin,
+      origin,
+      inputState: 'source-only',
+      reason: sourceFailure ?? 'source-refetch-failed',
+    };
     return {
       verify,
-      inputState,
+      inputState: 'source-only',
       sourceVerified: false,
-      renderedVerified: verify.valid && inputState === 'rendered-match',
-      displayValid: verify.valid && inputState === 'rendered-match',
-      reason: verify.valid ? null : verify.reason ?? 'unknown',
+      renderedVerified: false,
+      displayValid: false,
+      reason: verify.reason ?? 'source-refetch-failed',
     };
   }
 
-  const sourceVerify = await verifySignedSection(sourceSlice, {
+  const sourceVerify = await verifySignedSection(sourceElement, {
     ...options,
+    baseUrl: sourceBaseUrl ?? options.baseUrl,
+    renderedBaseUrl: documentBaseUrl(document, window.location.href),
     renderedSection: section,
-  });
+  } as Parameters<typeof verifySignedSection>[1]);
   const inputState = sourceVerify.inputState as VerificationInputState;
   if (!sourceVerify.valid) {
     return {
@@ -485,7 +523,7 @@ async function verifySectionWithState(
 }
 
 /**
- * Walk every <signed-section[signature]> on the page and verify it locally.
+ * Walk every <signed-section> on the page and verify it locally.
  *
  * Each section is verified independently. A failure on one does not skip
  * the others. Markers are inserted as the next sibling of the section
@@ -548,13 +586,11 @@ async function autoVerifyPage(
     ? mapSnapshotToLiveSections(fetchedSnapshot, liveSections)
     : { matches: [], complete: false };
 
-  // If the pristine fetch failed entirely OR returned a different count
-  // than the DOM (page re-rendered between navigation and our fetch, SPA
-  // route change, intercepting service worker), we fall back to per-section
-  // DOM-based verification. The runtime-mutation false-invalid risk
-  // re-applies, but it's better than no verification at all.
+  // A missing or ambiguous source is a hard failure. Verifying the live DOM
+  // here would allow page script to manufacture a valid result with no
+  // accepted source representation.
   if (pristineFetchError || !mapped.complete) {
-    debugLog(settings, 'source snapshot unavailable; falling back to rendered DOM verification', {
+    debugLog(settings, 'source snapshot unavailable; refusing rendered-DOM verification', {
       reason: pristineFetchError,
       sourceSections: fetchedSnapshot?.sections.length ?? 0,
       renderedSections: sections.length,
@@ -566,16 +602,21 @@ async function autoVerifyPage(
   for (const section of liveSections) {
     if (expectedNavigationRun !== navigationRun) return;
     // Idempotency: skip sections we've already decorated.
-    if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
+    const knownMarker = sectionMarkers.get(section);
+    if (knownMarker && !knownMarker.isConnected) sectionMarkers.delete(section);
+    if ((knownMarker?.isConnected ?? false) || section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
       continue;
     }
 
     try {
+      const match = mapped.matches.find((candidate) => candidate.live === section);
       const run = await verifySectionWithState(
         section,
-        mapped.complete ? (mapped.matches.find((match) => match.live === section)?.source.outerHTML ?? null) : null,
+        mapped.complete ? (match ? sourceElementForSnapshot(match.source) : null) : null,
+        fetchedSnapshot?.baseUrl ?? null,
         resolverChain,
         settings,
+        pristineFetchError || !mapped.complete ? sourceFailureReason(pristineFetchError) : null,
       );
       const verify = run.verify;
 
@@ -613,7 +654,13 @@ async function autoVerifyPage(
       };
       pageVerifications.push(pageVerification);
       pageVerificationBySection.set(section, pageVerification);
-      armSectionMutationInvalidation(section, mapped.complete ? (mapped.matches.find((match) => match.live === section)?.source.outerHTML ?? null) : null, resolverChain, settings);
+      armSectionMutationInvalidation(
+        section,
+        mapped.complete ? (match ? sourceElementForSnapshot(match.source) : null) : null,
+        fetchedSnapshot?.baseUrl ?? null,
+        resolverChain,
+        settings,
+      );
     } catch (err) {
       const reason = (err as Error).message ?? 'verification error';
       console.error('Content Signing: verification failed for a signed-section');
@@ -638,7 +685,7 @@ async function autoVerifyPage(
       };
       pageVerifications.push(pageVerification);
       pageVerificationBySection.set(section, pageVerification);
-      armSectionMutationInvalidation(section, null, resolverChain, settings);
+      armSectionMutationInvalidation(section, null, null, resolverChain, settings);
     }
     i++;
   }
@@ -713,11 +760,21 @@ function applySectionStatusUI(
   sig.textContent = valid ? '✓' : stale || verify?.valid ? '!' : '✗';
   sig.title = tooltip;
   badges.appendChild(sig);
-  section.parentNode?.insertBefore(badges, section.nextSibling);
+  const anchor = outermostSignedSection(section);
+  anchor.parentNode?.insertBefore(badges, anchor.nextSibling);
+  sectionMarkers.set(section, badges);
 }
 
 /** Remove only extension-owned sibling UI, leaving signed content untouched. */
 function clearSectionStatusUI(section: Element): void {
+  const marker = sectionMarkers.get(section);
+  if (marker) {
+    marker.remove();
+    sectionMarkers.delete(section);
+    return;
+  }
+  // Legacy markers created before this module's nested-section anchor was
+  // introduced may still be direct siblings. Remove only our own marker.
   let sibling = section.nextElementSibling;
   while (sibling?.classList.contains(AUTO_BADGE_MARKER)) {
     const next = sibling.nextElementSibling;
@@ -729,7 +786,8 @@ function clearSectionStatusUI(section: Element): void {
 /** Re-verify a section after live content changes, against its frozen source. */
 function armSectionMutationInvalidation(
   section: Element,
-  sourceSlice: string | null,
+  sourceElement: Element | null,
+  sourceBaseUrl: string | null,
   resolverChain: KeyResolver[],
   settings: Settings,
 ): void {
@@ -752,7 +810,8 @@ function armSectionMutationInvalidation(
       try {
         const run = await verifySectionWithState(
           changedSection,
-          sourceSlice,
+          sourceElement,
+          sourceBaseUrl,
           currentResolverChain.length ? currentResolverChain : resolverChain,
           activeSettings,
         );
@@ -1025,7 +1084,9 @@ function addVerificationBadges(element: Element, verificationResult: Verificatio
 
     // Keep extension UI outside the signed element. This prevents a badge or
     // tooltip from becoming part of the bytes that the signature protects.
-    element.parentNode?.insertBefore(badgeContainer, element.nextSibling);
+    const anchor = outermostSignedSection(element);
+    anchor.parentNode?.insertBefore(badgeContainer, anchor.nextSibling);
+    sectionMarkers.set(element, badgeContainer);
   } catch (error) {
     console.error('Failed to add verification badges:', error);
   }

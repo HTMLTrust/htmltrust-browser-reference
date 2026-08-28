@@ -3,6 +3,9 @@ import {
   mapSnapshotToLiveSections,
   mutationTouchesSignedSection,
   observeSignedSection,
+  mutationTouchesDocumentBase,
+  outermostSignedSection,
+  sourceElementForSnapshot,
   SIGNED_SECTION_SELECTOR,
 } from './navigation-lifecycle';
 
@@ -19,6 +22,17 @@ describe('navigation lifecycle snapshots', () => {
     expect(Object.isFrozen(snapshot)).toBe(true);
     expect(Object.isFrozen(snapshot.sections)).toBe(true);
     expect(Object.isFrozen(snapshot.sections[0])).toBe(true);
+    expect(sourceElementForSnapshot(snapshot.sections[0])?.localName).toBe('signed-section');
+  });
+
+  it('keeps nested sections paired as parser nodes and computes the source base URL', () => {
+    const snapshot = captureNavigationSnapshot(
+      '<base href="https://cdn.example/assets/"><signed-section signature="outer"><signed-section signature="inner">inner</signed-section></signed-section>',
+      'https://example.test/article',
+    );
+    expect(snapshot.baseUrl).toBe('https://cdn.example/assets/');
+    expect(snapshot.sections.map((section) => section.identity.includes('signature=')).every(Boolean)).toBe(true);
+    expect(sourceElementForSnapshot(snapshot.sections[0])?.querySelector('signed-section')?.getAttribute('signature')).toBe('inner');
   });
 
   it('maps reordered live sections by signed identity rather than array position', () => {
@@ -35,6 +49,13 @@ describe('navigation lifecycle snapshots', () => {
     expect(result.complete).toBe(true);
     expect(result.matches.map((match) => match.source.index)).toEqual([1, 0]);
     expect(result.matches.map((match) => match.live.textContent)).toEqual(['B changed', 'A changed']);
+  });
+
+  it('anchors nested-section markers after the outermost signed section', () => {
+    document.body.innerHTML = '<signed-section signature="outer"><signed-section signature="inner">text</signed-section></signed-section>';
+    const outer = document.querySelector('signed-section')!;
+    const inner = outer.querySelector('signed-section')!;
+    expect(outermostSignedSection(inner)).toBe(outer);
   });
 
   it('marks a missing or added live section as an incomplete mapping', () => {
@@ -79,6 +100,14 @@ describe('signed-section mutation invalidation', () => {
     expect(mutationTouchesSignedSection({ type: 'attributes', target: section, attributeName: 'signature' } as unknown as MutationRecord, section)).toBe(true);
     expect(mutationTouchesSignedSection({ type: 'childList', target: section, addedNodes: [], removedNodes: [] } as unknown as MutationRecord, section)).toBe(true);
     expect(mutationTouchesSignedSection({ type: 'attributes', target: document.querySelector('#indicator')! } as unknown as MutationRecord, section)).toBe(false);
+  });
+
+  it('recognizes source base URL changes but not ordinary sibling mutations', () => {
+    document.body.innerHTML = '<base href="https://example.test/"><signed-section signature="a">text</signed-section><div id="indicator"></div>';
+    const base = document.querySelector('base')!;
+    const indicator = document.querySelector('#indicator')!;
+    expect(mutationTouchesDocumentBase({ type: 'attributes', target: base, attributeName: 'href' } as unknown as MutationRecord)).toBe(true);
+    expect(mutationTouchesDocumentBase({ type: 'attributes', target: indicator, attributeName: 'class' } as unknown as MutationRecord)).toBe(false);
   });
 
   it('notifies after a mutation and ignores sibling indicators', async () => {
