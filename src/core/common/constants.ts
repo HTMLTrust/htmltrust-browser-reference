@@ -31,6 +31,7 @@ export const DEFAULT_SETTINGS = {
   highlightUnverified: false,
   trustDirectoryUrls: [] as string[],
   trustDirectoryUrl: '', // legacy, unused if trustDirectoryUrls is populated
+  trustDirectorySubscriptions: [] as Array<{ url: string; weight: number; enabled: boolean }>,
   personalTrustList: [] as string[],
   trustedDomains: [] as string[],
   authMethod: 'apikey' as const,

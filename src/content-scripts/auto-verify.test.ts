@@ -17,6 +17,7 @@ jest.mock('@htmltrust/browser-client', () => ({
   verifySignedSection: jest.fn(),
   evaluateTrustPolicy: jest.fn(),
   defaultResolverChain: jest.fn(() => []),
+  isPrivateHost: jest.fn((hostname: string) => hostname === '127.0.0.1' || hostname === 'localhost'),
 }));
 
 // The legacy content-extraction path is outside these lifecycle tests. Mocking
@@ -37,6 +38,7 @@ const {
   armSectionMutationInvalidation,
   autoVerifyPage,
   buildAutoBadges,
+  invalidateAutoVerifyGeneration,
   resetNavigationState,
 } = require('./index') as typeof import('./index');
 
@@ -223,6 +225,61 @@ describe('production content-script UI and lifecycle', () => {
     expect(document.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).not.toBeNull();
     const calls = (verifySignedSection as jest.Mock).mock.calls;
     expect(calls[calls.length - 1]?.[0]).toBe(newHTML);
+  });
+
+  it('does not let an older policy run overwrite results after settings change', async () => {
+    document.body.innerHTML = '<signed-section profile="htmltrust-signature-v1" signature="stable">text</signed-section>';
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      url: window.location.href,
+      text: async () => document.body.innerHTML,
+    });
+    let oldVerificationStarted!: () => void;
+    const oldStarted = new Promise<void>((resolve) => { oldVerificationStarted = resolve; });
+    let releaseOldVerification!: (result: VerifyResult) => void;
+    const oldVerification = new Promise<VerifyResult>((resolve) => {
+      releaseOldVerification = resolve;
+    });
+    let secondRun = false;
+    (verifySignedSection as jest.Mock).mockImplementation(() => {
+      if (secondRun) return Promise.resolve(verifyShape());
+      oldVerificationStarted();
+      return oldVerification;
+    });
+    (evaluateTrustPolicy as jest.Mock).mockResolvedValue(trustShape({ score: 91, indicator: 'green' }));
+
+    const oldRun = autoVerifyPage([], settings);
+    await oldStarted;
+    expect(verifySignedSection).toHaveBeenCalled();
+
+    // This is the same invalidation used by chrome.storage.onChanged, without
+    // depending on the browser API in this deterministic race test.
+    invalidateAutoVerifyGeneration();
+    document.querySelectorAll(`.${AUTO_BADGE_MARKER}`).forEach((marker) => marker.remove());
+    secondRun = true;
+    await autoVerifyPage([], { ...settings, trustedDomains: ['https://new-policy.example'] });
+    expect(verifySignedSection).toHaveBeenCalledTimes(2);
+    expect(evaluateTrustPolicy).toHaveBeenCalledTimes(1);
+    expect(document.querySelector(`.${AUTO_BADGE_MARKER}`)?.getAttribute('aria-label')).toContain('Trust: 91%');
+
+    releaseOldVerification(verifyShape({ keyid: 'old-result.example' }));
+    await oldRun;
+    expect(document.querySelector(`.${AUTO_BADGE_MARKER}`)?.getAttribute('aria-label')).toContain('Trust: 91%');
+  });
+
+  it('passes the hardened verifier fetch to every trust-policy evaluation', async () => {
+    document.body.innerHTML = '<signed-section profile="htmltrust-signature-v1" signature="fetch">text</signed-section>';
+    (verifySignedSection as jest.Mock).mockResolvedValue(verifyShape());
+    (evaluateTrustPolicy as jest.Mock).mockResolvedValue(trustShape());
+
+    await autoVerifyPage([], settings);
+
+    expect(evaluateTrustPolicy).toHaveBeenCalled();
+    for (const [, policy] of (evaluateTrustPolicy as jest.Mock).mock.calls) {
+      expect(policy.fetch).toEqual(expect.any(Function));
+      await expect(policy.fetch('http://private.example/')).rejects.toThrow('network-policy-blocked');
+      await expect(policy.fetch('https://127.0.0.1/')).rejects.toThrow('network-policy-blocked');
+    }
   });
 
   it('keeps the production auto badge builder warning-aware', () => {

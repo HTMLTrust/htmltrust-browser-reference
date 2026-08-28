@@ -31,7 +31,7 @@
 | **Verify Content** (Placeholder)    | `POST /content/verify` (Uses active server URL)         | **Major Change:** Replace placeholder. Plugin needs to find the signature (e.g., from page metadata, directory lookup), extract necessary fields (`contentHash`, `domain`, `authorId`, `signature`), and call the API on the *active server*.                                        |
 | **Content Extraction/Hashing**      | N/A (Client-side responsibility)                        | **No Change:** `ContentProcessor` logic remains relevant for preparing `contentHash`.                                                                                                                                                                                          |
 | **Metadata Extraction**             | N/A (Client-side, potentially used for claims)          | **No Change:** `ContentProcessor` logic remains. Extracted metadata could pre-populate claims for signing.                                                                                                                                                                   |
-| **Trust Directory Lookup** (Unused) | `/directory/*` endpoints (Uses active server URL)       | **Opportunity:** Can now implement features using `/directory/keys`, `/directory/content`, `/directory/keys/{keyId}/reputation` against the *active server* for richer verification context.                                                                                 |
+| **Trust Directory Lookup** | User-selected HTTPS directories using `/signers/{id}/reputation` | The extension keeps weighted subscriptions in browser storage and treats reputation as a policy input after local signature verification. |
 | **Settings Management**             | N/A (Client-side)                                       | **Change:** Settings need to be extended to manage a list of server configurations (URL, optional ApiKey, optional AuthorId, active status).                                                                                                                                     |
 | **Sign Out**                        | N/A (Client-side action)                                | **Change:** Signing out means deleting the stored `AuthorApiKey` and `authorId` *for the active server configuration*.                                                                                                                                                         |
 | **Key Reporting** (N/A)             | `POST /directory/keys/{keyId}/report`                   | **New Feature:** Can add UI/functionality to report keys using this endpoint (requires `GeneralApiKey`, potentially also managed per server or globally).                                                                                                                   |
@@ -97,7 +97,7 @@ graph TD
     end
 
     subgraph Directory [Directory Interaction (Optional)]
-        HH[Verification Flow] --> II(Call GET /directory/keys/{keyId}/reputation on Active Server);
+        HH[Verification Flow] --> II(Call GET /signers/{id}/reputation on each enabled configured directory);
         II --> JJ[Display Key Reputation];
         KK[User Action: Report Key/Content] --> LL{GeneralApiKey Present?};
         LL -- Yes --> MM[Call POST /directory/.../report on Active Server];

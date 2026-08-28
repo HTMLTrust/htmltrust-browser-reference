@@ -24,6 +24,7 @@ import {
   verifySignedSection,
   evaluateTrustPolicy,
   defaultResolverChain,
+  isPrivateHost,
   type VerifyResult,
   type TrustEvaluation,
   type TrustInput,
@@ -50,7 +51,8 @@ import {
   VoteType,
   Settings,
   VerificationInputState,
-  getTrustDirectoryUrls,
+  getTrustDirectorySubscriptions,
+  validateTrustDirectorySubscription,
 } from '../core/common/types';
 
 // Import platform-specific adapter
@@ -84,6 +86,7 @@ type PageVerification = {
   trustScore: number;
   trustIndicator: 'green' | 'yellow' | 'red';
   trustLabel: string;
+  trustInputs: Array<{ source: string; contribution: number; rationale: string }>;
   keyid: string;
   algorithm: string;
   signedAt: string;
@@ -116,6 +119,12 @@ let lifecycleInstalled = false;
 let baseObserverDisposer: (() => void) | null = null;
 const sectionReverifyGeneration = new WeakMap<Element, number>();
 
+function directoryUrls(settings: Settings): string[] {
+  return getTrustDirectorySubscriptions(settings)
+    .filter((subscription) => subscription.enabled && !validateTrustDirectorySubscription(subscription))
+    .map((subscription) => subscription.url);
+}
+
 /**
  * Pull authorId out of a `.../authors/{id}/public-key` keyid URL. Returns
  * null for keyids that aren't in this shape (e.g. did:web identifiers).
@@ -147,6 +156,16 @@ function authorIdFromKeyid(keyid: string): string | null {
  */
 let currentSettings: Settings | null = null;
 let currentResolverChain: KeyResolver[] = [];
+// Settings changes invalidate every in-flight auto-verification. A run may
+// await source fetch, key resolution, or directory policy requests, so the
+// generation is checked again before it can mutate markers or cached results.
+let autoVerifyGeneration = 0;
+
+/** Invalidate in-flight runs when policy inputs change. */
+export function invalidateAutoVerifyGeneration(): void {
+  autoVerifyGeneration += 1;
+  pageVerifications.length = 0;
+}
 
 async function initialize() {
   try {
@@ -154,7 +173,7 @@ async function initialize() {
 
     // 1. Settings → resolver chain + trust policy inputs
     currentSettings = await loadSettings();
-    const directories = getTrustDirectoryUrls(currentSettings);
+    const directories = directoryUrls(currentSettings);
     currentResolverChain = defaultResolverChain({
       directories,
       fetch: createVerifierFetch(),
@@ -186,10 +205,17 @@ async function initialize() {
         if (!next) return;
         currentSettings = next;
         currentResolverChain = defaultResolverChain({
-          directories: getTrustDirectoryUrls(next),
+          directories: directoryUrls(next),
           fetch: createVerifierFetch(),
         });
-        redecoratePage();
+        invalidateAutoVerifyGeneration();
+        // Settings may change the trust policy or its directory set. Clear
+        // old markers and rerun against the frozen navigation source so a
+        // stale page snapshot never displays a result for the previous policy.
+        document.querySelectorAll(SIGNED_SECTION_SELECTOR).forEach((section) => {
+          clearSectionStatusUI(section);
+        });
+        void autoVerifyPage(currentResolverChain, next, navigationRun, autoVerifyGeneration);
       });
     }
   } catch (error) {
@@ -233,7 +259,7 @@ function redecoratePage(): void {
     const trustShape: TrustEvaluation = {
       score: cached.trustScore,
       indicator: cached.trustIndicator,
-      inputs: [],
+      inputs: cached.trustInputs ?? [],
     };
     const runShape: SectionVerificationRun = {
       verify: verifyShape,
@@ -250,6 +276,7 @@ function redecoratePage(): void {
 /** Reset cached state before a same-document navigation or page rerender. */
 export function resetNavigationState(): void {
   navigationRun += 1;
+  invalidateAutoVerifyGeneration();
   if (rerenderTimer !== null) {
     clearTimeout(rerenderTimer);
     rerenderTimer = null;
@@ -260,7 +287,6 @@ export function resetNavigationState(): void {
     clearSectionStatusUI(section);
   });
   observedSections = new Set<Element>();
-  pageVerifications.length = 0;
   navigationSnapshot = null;
 }
 
@@ -346,6 +372,7 @@ async function loadSettings(): Promise<Settings> {
     highlightVerified: true,
     highlightUnverified: false,
     trustDirectoryUrls: [],
+    trustDirectorySubscriptions: [],
     personalTrustList: [],
     trustedDomains: [],
     authMethod: 'apikey',
@@ -393,9 +420,13 @@ function debugLog(settings: Settings, message: string, details?: unknown): void 
 
 function createVerifierFetch(): typeof fetch {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
+    const inputUrl = typeof input === 'string' || input instanceof URL ? input.toString() : input.url;
+    const url = new URL(inputUrl);
     if (url.protocol !== 'https:') {
       throw new Error('network-policy-blocked: verifier key and directory fetches require HTTPS');
+    }
+    if (url.username || url.password || isPrivateHost(url.hostname)) {
+      throw new Error('network-policy-blocked: verifier fetches may not target private or credential-bearing URLs');
     }
     return fetch(input, {
       ...init,
@@ -539,11 +570,16 @@ export async function autoVerifyPage(
   resolverChain: KeyResolver[],
   settings: Settings,
   expectedNavigationRun = navigationRun,
+  expectedAutoVerifyGeneration = autoVerifyGeneration,
 ): Promise<void> {
   // `autoVerify` gates the entire content-script verification path. When off,
   // the page is left untouched and the popup's "Verifying…" state stays put
   // until the user explicitly triggers verification.
-  if (!settings.autoVerify || expectedNavigationRun !== navigationRun) {
+  if (
+    !settings.autoVerify ||
+    expectedNavigationRun !== navigationRun ||
+    expectedAutoVerifyGeneration !== autoVerifyGeneration
+  ) {
     return;
   }
 
@@ -580,7 +616,10 @@ export async function autoVerifyPage(
   // cache catches per RFC 7234 when the origin sets reasonable cache headers.
   const { snapshot: fetchedSnapshot, error: pristineFetchError } =
     await fetchPristineSignedSections(settings);
-  if (expectedNavigationRun !== navigationRun) return;
+  if (
+    expectedNavigationRun !== navigationRun ||
+    expectedAutoVerifyGeneration !== autoVerifyGeneration
+  ) return;
   navigationSnapshot = fetchedSnapshot;
   const liveSections = Array.from(sections);
   observedSections = new Set(liveSections);
@@ -602,7 +641,10 @@ export async function autoVerifyPage(
 
   let i = 0;
   for (const section of liveSections) {
-    if (expectedNavigationRun !== navigationRun) return;
+    if (
+      expectedNavigationRun !== navigationRun ||
+      expectedAutoVerifyGeneration !== autoVerifyGeneration
+    ) return;
     // Idempotency: skip sections we've already decorated.
     const knownMarker = sectionMarkers.get(section);
     if (knownMarker && !knownMarker.isConnected) sectionMarkers.delete(section);
@@ -623,19 +665,17 @@ export async function autoVerifyPage(
       );
       const verify = run.verify;
 
-      // Layer 2: trust policy. directorySubscriptions is intentionally empty
-      // here — the spec-compliant `<dir>/keys/<keyid>/reputation` endpoint
-      // shape is not yet implemented by the reference trust server. The e2e
-      // harness layers reports/score on top via a custom server lookup; the
-      // extension follows the same TODO pattern and stays out of that
-      // business until the server endpoint exists.
-      // TODO(directory-shape): wire `directorySubscriptions` once the trust
-      // server exposes `/keys/{keyid}/reputation` per spec.
       const trust = await evaluateTrustPolicy(verify, {
         personalTrustList,
         trustedDomains,
-        directorySubscriptions: [],
+        directorySubscriptions: getTrustDirectorySubscriptions(settings),
+        fetch: createVerifierFetch(),
       });
+
+      if (
+        expectedNavigationRun !== navigationRun ||
+        expectedAutoVerifyGeneration !== autoVerifyGeneration
+      ) return;
 
       applySectionStatusUI(section, run, trust, null, settings);
       const pageVerification: PageVerification = {
@@ -647,8 +687,9 @@ export async function autoVerifyPage(
         renderedVerified: run.renderedVerified,
         reason: run.reason,
         trustScore: trust.score,
-        trustIndicator: trust.indicator,
-        trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+          trustIndicator: trust.indicator,
+          trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+        trustInputs: trust.inputs,
         keyid: verify.keyid,
         algorithm: verify.algorithm,
         signedAt: verify.signedAt,
@@ -666,6 +707,10 @@ export async function autoVerifyPage(
         settings,
       );
     } catch (err) {
+      if (
+        expectedNavigationRun !== navigationRun ||
+        expectedAutoVerifyGeneration !== autoVerifyGeneration
+      ) return;
       const reason = (err as Error).message ?? 'verification error';
       console.error('Content Signing: verification failed for a signed-section');
       debugLog(settings, 'signed-section verification exception', { reason });
@@ -681,6 +726,7 @@ export async function autoVerifyPage(
         trustScore: 0,
         trustIndicator: 'red',
         trustLabel: 'Untrusted',
+        trustInputs: [],
         keyid: '',
         algorithm: '',
         signedAt: '',
@@ -798,6 +844,7 @@ export function armSectionMutationInvalidation(
 ): void {
   sectionObserverDisposers.get(section)?.();
   const observerNavigationRun = navigationRun;
+  const observerAutoVerifyGeneration = autoVerifyGeneration;
   const dispose = observeSignedSection(section, (changedSection) => {
     const generation = (sectionReverifyGeneration.get(changedSection) ?? 0) + 1;
     sectionReverifyGeneration.set(changedSection, generation);
@@ -824,11 +871,13 @@ export function armSectionMutationInvalidation(
         const trust = await evaluateTrustPolicy(run.verify, {
           personalTrustList: activeSettings.personalTrustList ?? [],
           trustedDomains: activeSettings.trustedDomains ?? [],
-          directorySubscriptions: [],
+          directorySubscriptions: getTrustDirectorySubscriptions(activeSettings),
+          fetch: createVerifierFetch(),
         });
         if (
           sectionReverifyGeneration.get(changedSection) !== generation ||
-          navigationRun !== observerNavigationRun
+          navigationRun !== observerNavigationRun ||
+          autoVerifyGeneration !== observerAutoVerifyGeneration
         ) return;
         applySectionStatusUI(changedSection, run, trust, null, activeSettings);
         const existing = pageVerificationBySection.get(changedSection);
@@ -843,7 +892,8 @@ export function armSectionMutationInvalidation(
           reason: run.reason,
           trustScore: trust.score,
           trustIndicator: trust.indicator,
-          trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+        trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+          trustInputs: trust.inputs,
           keyid: run.verify.keyid,
           algorithm: run.verify.algorithm,
           signedAt: run.verify.signedAt,
@@ -856,7 +906,8 @@ export function armSectionMutationInvalidation(
       } catch (error) {
         if (
           sectionReverifyGeneration.get(changedSection) !== generation ||
-          navigationRun !== observerNavigationRun
+          navigationRun !== observerNavigationRun ||
+          autoVerifyGeneration !== observerAutoVerifyGeneration
         ) return;
         const reason = error instanceof Error ? error.message : String(error);
         applySectionStatusUI(
@@ -879,6 +930,7 @@ export function armSectionMutationInvalidation(
             trustScore: 0,
             trustIndicator: 'red',
             trustLabel: 'Untrusted',
+            trustInputs: [],
           };
           pageVerificationBySection.set(changedSection, failed);
           const index = pageVerifications.indexOf(existing);

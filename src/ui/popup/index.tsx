@@ -34,6 +34,7 @@ interface PageVerification {
   trustScore: number;
   trustIndicator: 'green' | 'yellow' | 'red';
   trustLabel: string;
+  trustInputs: Array<{ source: string; contribution: number; rationale: string }>;
   keyid: string;
   algorithm: string;
   signedAt: string;
@@ -482,6 +483,18 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
                       <strong>Input:</strong> {v.inputState}
                       {v.reason && v.cryptoValid ? ` (${v.reason})` : ''}
                     </div>
+                    {(v.trustInputs ?? []).length > 0 ? (
+                      <details style={{ marginTop: 4 }}>
+                        <summary>Why this trust result?</summary>
+                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
+                          {(v.trustInputs ?? []).map((input) => (
+                            <li key={`${input.source}-${input.rationale}`}>
+                              {input.rationale}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null}
                     {v.keyid ? (
                       <div style={{ wordBreak: 'break-all' }}>
                         <strong>Signer:</strong> {v.keyid}

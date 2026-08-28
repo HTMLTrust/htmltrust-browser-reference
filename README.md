@@ -29,7 +29,12 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependencies pin browser client commit `39dc873c` and canonicalization commit `5e51040d`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependencies pin browser client commit
+`e7cf034bc696f78f22707823001af5d9d8ba7541` and canonicalization commit
+`5e51040dcaaf50935e245702bdefbc18a1d542ce`. These are the revisions recorded
+in `package.json` and `package-lock.json`; update both files together when the
+release revision changes. A sibling browser-client checkout is optional. Use
+one when developing both repositories together.
 
 For a standalone checkout:
 
@@ -64,7 +69,12 @@ restore the pinned commit.
 npm test -- --runInBand
 npm run typecheck
 npm run lint
+npm run build:chromium
 ```
+
+The last command is a clean verification build for the default supported
+runtime, Chromium. `npm run build:all` builds and archives all three packaging
+targets.
 
 Tests use jsdom for DOM behavior. Run the complete check in a Node 22
 container with:
@@ -91,7 +101,12 @@ Build one browser with `npm run build:chromium`, `npm run build:firefox`, or `np
 npm run build:all
 ```
 
-The unpacked extension is written to `build/<browser>/`. For Chromium, open `chrome://extensions/`, enable Developer mode, choose **Load unpacked**, and select `build/chromium/`.
+The unpacked extension is written to `build/<browser>/`, with a zip archive in
+`build/`. Chromium is the implemented runtime adapter. Firefox and Safari
+currently have packaging targets and manifests, but their runtime adapters are
+pending, so those builds do not claim working extension support in those
+browsers. For Chromium, open `chrome://extensions/`, enable Developer mode,
+choose **Load unpacked**, and select `build/chromium/`.
 
 ### Development
 
@@ -111,6 +126,18 @@ Use the matching `dev:firefox` or `dev:safari` command for another target. Reloa
 - The content script inserts markers beside the outermost signed element. The marker, tooltip, and vote controls are outside signed content, including when sections are nested.
 
 The popup receives copied result records. It cannot mutate the content script's verification cache.
+
+## Trust directory policy
+
+Open **Options**, add a directory, choose a weight from 0 to 1, and leave the
+subscription disabled until you want it consulted. The extension stores these
+rows in browser storage. Each enabled row is queried by the background or
+content verifier at `GET /signers/{id}/reputation`; the page marker and popup
+show cryptographic validity separately from the resulting directory trust.
+Only the signer identifier is sent to a configured HTTPS directory. Invalid
+URLs and weights are rejected before settings are saved. A timeout, malformed
+response, unavailable directory, or conflicting result leaves the other policy
+inputs visible and does not turn a valid signature into an invalid one.
 
 ## Architecture
 

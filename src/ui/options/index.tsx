@@ -3,7 +3,13 @@
  */
 import React, { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Settings, Profile, getTrustDirectoryUrls } from '../../core/common';
+import {
+  Settings,
+  Profile,
+  DirectorySubscription,
+  getTrustDirectorySubscriptions,
+  validateTrustDirectorySubscription,
+} from '../../core/common';
 import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_PROFILE } from '../../core/common/constants';
 import { PlatformAdapter, MessageContext } from '../../platforms/common';
 import { ProfileManager } from '../../ui/components';
@@ -104,19 +110,46 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
     }));
   };
 
+  // Keep raw rows in the form so an invalid URL stays visible until the user
+  // fixes it. The background validates the same rows before persistence.
+  const directorySubscriptions: DirectorySubscription[] = Array.isArray(state.settings.trustDirectorySubscriptions)
+    ? state.settings.trustDirectorySubscriptions
+    : getTrustDirectorySubscriptions(state.settings);
+
+  const updateDirectorySubscriptions = (subscriptions: DirectorySubscription[]) => {
+    setState(prevState => ({
+      ...prevState,
+      settings: {
+        ...prevState.settings,
+        trustDirectorySubscriptions: subscriptions,
+        trustDirectoryUrls: subscriptions.map(subscription => subscription.url),
+        trustDirectoryUrl: '',
+      },
+      isSaved: false,
+    }));
+  };
+
   // Handle save settings
   const handleSaveSettings = async () => {
     try {
+      const invalid = directorySubscriptions
+        .map(validateTrustDirectorySubscription)
+        .find((message): message is string => message !== null);
+      if (invalid) {
+        setState(prevState => ({ ...prevState, error: invalid }));
+        return;
+      }
       setState(prevState => ({ ...prevState, isLoading: true }));
-      
-      // Save the settings to storage
-      const storage = adapter.getStorage();
-      await storage.set(STORAGE_KEYS.SETTINGS, state.settings);
       
       // Notify the background script that settings have changed
       await adapter.sendMessage(MessageContext.OPTIONS, {
         type: 'UPDATE_SETTINGS',
-        settings: state.settings,
+        settings: {
+          ...state.settings,
+          trustDirectorySubscriptions: directorySubscriptions,
+          trustDirectoryUrls: directorySubscriptions.map(subscription => subscription.url),
+          trustDirectoryUrl: '',
+        },
       });
       
       setState(prevState => ({
@@ -468,38 +501,70 @@ const Options: React.FC<OptionsProps> = ({ adapter }) => {
         <div className="option-group">
           <h2>Trust Directory Settings</h2>
 
-          <div className="option">
-            <label htmlFor="trustDirectoryUrls">
-              Trust Directory URLs
-            </label>
-            <textarea
-              id="trustDirectoryUrls"
-              value={(getTrustDirectoryUrls(state.settings)).join('\n')}
-              onChange={(e) => {
-                // One URL per line; empty lines and surrounding whitespace are
-                // trimmed at save time. Order matters: the resolver chain
-                // tries each directory in order until one resolves a keyid.
-                const list = e.target.value
-                  .split('\n')
-                  .map((s) => s.trim())
-                  .filter((s) => s.length > 0);
-                handleSettingChange('trustDirectoryUrls', list);
-                // Clear the legacy single-URL field so getTrustDirectoryUrls
-                // never falls back to it once the user has explicitly set
-                // the list (even to empty).
-                handleSettingChange('trustDirectoryUrl', '');
-              }}
-              placeholder={'https://eff.org/directory\nhttps://aclu.org/directory'}
-              rows={4}
-              style={{ width: '100%', fontFamily: 'monospace' }}
-            />
-            <p className="option-description">
-              One trust directory base URL per line. The keyid resolver chain
-              consults these after did:web and direct-URL resolution. Leave
-              empty if you only verify keyids that are themselves URLs or
-              did:web identifiers.
-            </p>
-          </div>
+          <p className="option-description">
+            Reputation is an optional policy input. Signature validity is
+            computed locally first. Each enabled directory receives only the
+            signer keyid, over HTTPS, and contributes according to its weight.
+          </p>
+          {directorySubscriptions.map((subscription, index) => (
+            <div className="option" key={`${subscription.url}-${index}`} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <input
+                aria-label={`Trust directory ${index + 1} URL`}
+                value={subscription.url}
+                onChange={(e) => {
+                  const next = [...directorySubscriptions];
+                  next[index] = { ...subscription, url: e.target.value };
+                  updateDirectorySubscriptions(next);
+                }}
+                placeholder="https://directory.example"
+                style={{ flex: 1, fontFamily: 'monospace' }}
+              />
+              <label>
+                Weight
+                <input
+                  aria-label={`Trust directory ${index + 1} weight`}
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={subscription.weight}
+                  onChange={(e) => {
+                    const next = [...directorySubscriptions];
+                    next[index] = { ...subscription, weight: Number(e.target.value) };
+                    updateDirectorySubscriptions(next);
+                  }}
+                  style={{ width: '72px' }}
+                />
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={subscription.enabled}
+                  onChange={(e) => {
+                    const next = [...directorySubscriptions];
+                    next[index] = { ...subscription, enabled: e.target.checked };
+                    updateDirectorySubscriptions(next);
+                  }}
+                />
+                Enabled
+              </label>
+              <button
+                type="button"
+                onClick={() => updateDirectorySubscriptions(directorySubscriptions.filter((_, item) => item !== index))}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => updateDirectorySubscriptions([
+              ...directorySubscriptions,
+              { url: '', weight: 1, enabled: true },
+            ])}
+          >
+            Add trust directory
+          </button>
         </div>
 
         <div className="option-group">

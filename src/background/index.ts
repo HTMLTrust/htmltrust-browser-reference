@@ -3,6 +3,7 @@
  */
 import {
   verifySignedSection,
+  evaluateTrustPolicy,
   defaultResolverChain,
   isPrivateHost,
 } from "@htmltrust/browser-client";
@@ -14,7 +15,8 @@ import {
   AuthorVote,
   BatchedVotesPayload,
   BatchVoteResult,
-  getTrustDirectoryUrls,
+  getTrustDirectorySubscriptions,
+  validateTrustDirectorySubscription,
   buildKeyidUrl,
   requireCanonicalBase64,
   requireContentHash,
@@ -304,6 +306,7 @@ async function verifyContent(url: string): Promise<any> {
     if (!pristine) {
       verificationResult = {
         verified: false,
+        cryptoValid: false,
         reason: "No signed-section found on this page",
         verifiedAt: Date.now(),
         domain: serializedOrigin(url),
@@ -314,7 +317,9 @@ async function verifyContent(url: string): Promise<any> {
       // background service worker context, which has SubtleCrypto. The
       // resolver chain is built from the user's configured directory list;
       // empty list still works for did:web and direct-URL keyids.
-      const directories = getTrustDirectoryUrls(settings);
+      const directories = getTrustDirectorySubscriptions(settings)
+        .filter((subscription) => subscription.enabled && !validateTrustDirectorySubscription(subscription))
+        .map((subscription) => subscription.url);
       const resolverChain = defaultResolverChain({
         directories,
         fetch: createVerifierFetch(),
@@ -353,8 +358,15 @@ async function verifyContent(url: string): Promise<any> {
           }
         }
 
+        const trust = await evaluateTrustPolicy(verify, {
+          personalTrustList: settings.personalTrustList ?? [],
+          trustedDomains: settings.trustedDomains ?? [],
+          directorySubscriptions: getTrustDirectorySubscriptions(settings),
+          fetch: createVerifierFetch(),
+        });
         verificationResult = {
           verified: true,
+          cryptoValid: true,
           verifiedAt: Date.now(),
           domain: serializedOrigin(url),
           user: {
@@ -364,15 +376,21 @@ async function verifyContent(url: string): Promise<any> {
             publicKey: "",
             verified: true,
           },
-          trustStatus: "trusted",
+          trustStatus: trust.indicator === "green" ? "trusted" : trust.indicator === "red" ? "untrusted" : "unknown",
+          trustScore: trust.score,
+          trustIndicator: trust.indicator,
+          trustInputs: trust.inputs,
         };
       } else {
         verificationResult = {
           verified: false,
+          cryptoValid: false,
           reason: verify.reason || "Signature verification failed",
           verifiedAt: Date.now(),
           domain: serializedOrigin(url),
           trustStatus: "untrusted",
+          trustScore: 0,
+          trustIndicator: "red",
         };
       }
     }
@@ -792,7 +810,20 @@ async function removeServer(id: string): Promise<any> {
  * @returns A promise that resolves when the settings are updated
  */
 async function updateSettings(newSettings: Settings): Promise<void> {
-  settings = newSettings;
+  if (Array.isArray(newSettings.trustDirectorySubscriptions)) {
+    const invalid = newSettings.trustDirectorySubscriptions
+      .map(validateTrustDirectorySubscription)
+      .find((message): message is string => message !== null);
+    if (invalid) throw new Error(invalid);
+  }
+  const subscriptions = getTrustDirectorySubscriptions(newSettings);
+  if (Array.isArray(newSettings.trustDirectorySubscriptions) && subscriptions.length !== newSettings.trustDirectorySubscriptions.length) {
+    throw new Error("Invalid trust directory subscription; use an HTTPS URL and a weight between 0 and 1");
+  }
+  settings = {
+    ...newSettings,
+    trustDirectorySubscriptions: subscriptions,
+  };
   await storage.set(STORAGE_KEYS.SETTINGS, settings);
 
   // Update the badge

@@ -206,6 +206,16 @@ export type TrustStatus = 'trusted' | 'untrusted' | 'unknown';
  */
 export type VerificationInputState = 'source-only' | 'stale' | 'rendered-match';
 
+/** A user-selected trust directory and its policy weight. */
+export interface DirectorySubscription {
+  /** HTTPS directory base URL. */
+  url: string;
+  /** Contribution multiplier. Values outside 0..1 are rejected. */
+  weight: number;
+  /** Keep the subscription visible while preventing network requests. */
+  enabled: boolean;
+}
+
 /**
  * Represents the result of a content verification
  */
@@ -222,6 +232,12 @@ export interface VerificationResult {
   verifiedAt: number;
   /** The trust status of the verification */
   trustStatus?: TrustStatus;
+  /** Cryptographic validity remains separate from this policy result. */
+  cryptoValid?: boolean;
+  /** Local trust-policy result, if policy evaluation was requested. */
+  trustScore?: number;
+  trustIndicator?: 'trusted' | 'unknown' | 'untrusted' | 'green' | 'yellow' | 'red';
+  trustInputs?: Array<{ source: string; contribution: number; rationale: string }>;
   /** The domain of the content */
   domain?: string;
   /** Settings for displaying verification UI */
@@ -262,6 +278,8 @@ export interface Settings {
    * directory that resolves a keyid wins.
    */
   trustDirectoryUrls?: string[];
+  /** Weighted, user-controlled reputation subscriptions. */
+  trustDirectorySubscriptions?: DirectorySubscription[];
   /**
    * User's personal trust list, expressed as keyid strings (typically
    * did:web identifiers or direct public-key URLs). Empty by default;
@@ -296,12 +314,60 @@ export interface Settings {
  */
 export function getTrustDirectoryUrls(settings: Pick<Settings, 'trustDirectoryUrls' | 'trustDirectoryUrl'>): string[] {
   if (settings.trustDirectoryUrls && settings.trustDirectoryUrls.length > 0) {
-    return settings.trustDirectoryUrls.filter((u) => u && u.trim().length > 0);
+    return settings.trustDirectoryUrls
+      .filter((u) => u && u.trim().length > 0)
+      .map((u) => u.trim());
   }
   if (settings.trustDirectoryUrl && settings.trustDirectoryUrl.trim().length > 0) {
     return [settings.trustDirectoryUrl.trim()];
   }
   return [];
+}
+
+/**
+ * Return the canonical weighted subscriptions. Legacy URL-only settings are
+ * migrated in memory with neutral weight and enabled state. Invalid entries
+ * are excluded so malformed persisted data cannot trigger a request.
+ */
+export function getTrustDirectorySubscriptions(
+  settings: Pick<Settings, 'trustDirectorySubscriptions' | 'trustDirectoryUrls' | 'trustDirectoryUrl'>,
+): DirectorySubscription[] {
+  if (Array.isArray(settings.trustDirectorySubscriptions)) {
+    return settings.trustDirectorySubscriptions
+      .map((subscription) => {
+        if (!subscription || typeof subscription.url !== 'string') return null;
+        const url = subscription.url.trim();
+        const weight = Number(subscription.weight);
+        if (!url || !Number.isFinite(weight) || weight < 0 || weight > 1) return null;
+        return { url, weight, enabled: subscription.enabled !== false };
+      })
+      .filter((subscription): subscription is DirectorySubscription => subscription !== null);
+  }
+  return getTrustDirectoryUrls(settings).map((url) => ({ url, weight: 1, enabled: true }));
+}
+
+/** Validate a subscription before it is persisted or used for network I/O. */
+export function validateTrustDirectorySubscription(subscription: Partial<DirectorySubscription>): string | null {
+  if (typeof subscription.url !== 'string' || !subscription.url.trim()) return 'Directory URL is required';
+  let parsed: URL;
+  try {
+    parsed = new URL(subscription.url.trim());
+  } catch {
+    return 'Directory URL must be an absolute HTTPS URL';
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    !parsed.hostname
+  ) {
+    return 'Directory URL must use HTTPS, cannot contain credentials, query, or fragment';
+  }
+  const weight = Number(subscription.weight);
+  if (!Number.isFinite(weight) || weight < 0 || weight > 1) return 'Directory weight must be between 0 and 1';
+  return null;
 }
 
 /**

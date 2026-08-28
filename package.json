@@ -51,7 +51,7 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
-    "@htmltrust/browser-client": "git+https://github.com/HTMLTrust/htmltrust-browser-client.git#39dc873c368ff53b5d0295fbe4d8f493dea52f90",
+    "@htmltrust/browser-client": "git+https://github.com/HTMLTrust/htmltrust-browser-client.git#e7cf034bc696f78f22707823001af5d9d8ba7541",
     "@htmltrust/canonicalization": "https://github.com/HTMLTrust/htmltrust-canonicalization/archive/5e51040dcaaf50935e245702bdefbc18a1d542ce.tar.gz",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
