@@ -19,7 +19,7 @@ Readers: contributors and implementers. The normal workflow is:
 2. Run tests and type checking.
 3. Build the extension for the browser you use.
 
-After each page load or same-document navigation, the content script refetches the current HTTPS URL using the browser HTTP cache when available. It retains each exact signed-section source slice and a parser-owned DOM element. It verifies the source against the final response URL, then compares it with the live element. If page code changes a signed element, the extension marks it as stale and re-verifies it. A refetch can differ from the original response on personalized, time-varying, or service-worker-controlled pages. Status markers are siblings of `<signed-section>`, so extension UI cannot become signed content.
+After each page load or same-document navigation, the content script refetches the current HTTPS URL using the browser HTTP cache when available. It retains each exact signed-section source slice and a parser-owned DOM element. It verifies the source against the final response URL, then compares it with the live element. If page code changes a signed element, the extension marks it as stale and re-verifies it. A refetch can differ from the original response on personalized, time-varying, or service-worker-controlled pages. Status markers are inserted outside the outermost signed section, so extension UI cannot become signed content.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependencies pin browser client commit `d25c6d3c` and canonicalization commit `b0c8f305`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependencies pin browser client commit `d25c6d3c` and canonicalization commit `5e51040d`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
 
 For a standalone checkout:
 
@@ -74,8 +74,14 @@ container with:
 ```
 
 The script copies this checkout into the container, installs the pinned browser
-client from Git, runs 64 extension tests, checks types and lint, then builds all
+client from Git, runs the extension test suite, checks types and lint, then builds all
 three browser packages. Generated files stay outside the checkout.
+
+The content-script lifecycle suite imports the production `index.ts` functions
+with bootstrap disabled only inside Jest. It covers source mapping failures,
+nested marker placement, stale/source-only warnings, mutation invalidation, and
+navigation snapshot reset; packaged builds retain the normal document-idle
+bootstrap.
 
 ### Build
 
@@ -102,7 +108,7 @@ Use the matching `dev:firefox` or `dev:safari` command for another target. Reloa
 - `captureNavigationSnapshot` retains exact source slices, parser-owned elements, the final response URL, and the document base URL.
 - `mapSnapshotToLiveSections` pairs source sections with live elements by signed attributes, so page reordering does not pair one signature with another.
 - `observeSignedSection` watches only the live signed element. Mutations trigger re-verification against the immutable source section. History changes and replacement of signed sections trigger a fresh page refetch.
-- The content script inserts markers beside the signed element. The marker, tooltip, and vote controls are outside signed content.
+- The content script inserts markers beside the outermost signed element. The marker, tooltip, and vote controls are outside signed content, including when sections are nested.
 
 The popup receives copied result records. It cannot mutate the content script's verification cache.
 

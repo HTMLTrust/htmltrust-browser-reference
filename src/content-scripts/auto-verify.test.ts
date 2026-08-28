@@ -1,33 +1,17 @@
 /**
- * Tests for the auto-verify flow that runs on DOMContentLoaded.
+ * Production content-script lifecycle tests.
  *
- * The content script in src/content-scripts/index.ts is hard to import
- * directly under jest because it self-bootstraps on module load (it pulls in
- * the chromium platform adapter, registers DOM listeners, etc.). What we
- * verify here instead are the load-bearing invariants the migration is
- * supposed to guarantee:
- *
- *   1. The selector `signed-section` finds every element the content
- *      script's autoVerifyPage walks over, including malformed sections.
- *   2. Mocking @htmltrust/browser-client and replaying the same end-to-end
- *      shape autoVerifyPage uses produces a badge container with the
- *      expected CSS classes for both verified and unverified results, and
- *      that errors during verification produce an error badge with the
- *      unverified-class set. This guards the visible UX contract.
- *   3. CSS class names used for trust badges line up with the constants
- *      shipped in the extension stylesheet.
- *
- * The reusable shape replicated below mirrors the production
- * autoVerifyPage()/buildAutoBadges()/buildErrorBadges() in
- * content-scripts/index.ts. If you change those, mirror the change here.
- *
- * NOTE: this file uses element.innerHTML to construct jsdom test fixtures.
- * That is safe in a unit test (no untrusted input ever reaches it) and is
- * the standard idiom; the security hook may flag it but the warning does
- * not apply to test fixtures.
+ * The module is imported with its normal bootstrap gated only for this Jest
+ * process. Every assertion below calls the functions used by the packaged
+ * content script; there is no copied DOM walker or badge renderer here.
  */
 import { CSS_CLASSES } from '../core/common/constants';
-import { SIGNED_SECTION_SELECTOR } from '../core/content/navigation-lifecycle';
+import type { Settings } from '../core/common/types';
+import type { VerifyResult, TrustEvaluation } from '@htmltrust/browser-client';
+
+// Must be set before requiring index.ts, whose packaged entrypoint bootstraps
+// itself as soon as it is loaded.
+(globalThis as { __HTMLTRUST_TESTING__?: boolean }).__HTMLTRUST_TESTING__ = true;
 
 jest.mock('@htmltrust/browser-client', () => ({
   verifySignedSection: jest.fn(),
@@ -35,275 +19,215 @@ jest.mock('@htmltrust/browser-client', () => ({
   defaultResolverChain: jest.fn(() => []),
 }));
 
+// The legacy content-extraction path is outside these lifecycle tests. Mocking
+// only that leaf avoids pulling the browser-client's ESM canonicalizer into
+// Jest while leaving navigation-lifecycle.ts and index.ts production code
+// intact.
+jest.mock('../core/content/content-processor', () => ({
+  ContentProcessor: jest.fn().mockImplementation(() => ({ extractContent: jest.fn() })),
+}));
+
 import {
-  verifySignedSection,
   evaluateTrustPolicy,
+  verifySignedSection,
 } from '@htmltrust/browser-client';
+
+const {
+  applySectionStatusUI,
+  armSectionMutationInvalidation,
+  autoVerifyPage,
+  buildAutoBadges,
+  resetNavigationState,
+} = require('./index') as typeof import('./index');
 
 const AUTO_BADGE_MARKER = 'cs-auto-verification-badges';
 
-/**
- * Build a fixture DOM. Wraps element construction so we don't write a
- * literal innerHTML string at the call site (keeps the security hook quiet
- * and makes the fixture intent explicit).
- */
-function fixture(html: string): void {
-  const container = document.createElement('div');
-  // eslint-disable-next-line no-restricted-syntax
-  container.insertAdjacentHTML('afterbegin', html);
-  while (document.body.firstChild) document.body.removeChild(document.body.firstChild);
-  while (container.firstChild) document.body.appendChild(container.firstChild);
+const settings: Settings = {
+  autoVerify: true,
+  showBadges: true,
+  highlightVerified: true,
+  highlightUnverified: true,
+  trustDirectoryUrls: [],
+  personalTrustList: [],
+  trustedDomains: [],
+  authMethod: 'apikey',
+  serverConfigs: [],
+  developerDebugLogging: false,
+};
+
+function verifyShape(overrides: Partial<VerifyResult> = {}): VerifyResult {
+  return {
+    valid: true,
+    keyid: 'did:web:example.test',
+    algorithm: 'ed25519',
+    contentHash: 'sha256:content',
+    claimsHash: 'sha256:claims',
+    claims: {},
+    signedAt: '2026-08-28T00:00:00Z',
+    domain: 'https://example.test',
+    origin: 'https://example.test',
+    inputState: 'rendered-match',
+    ...overrides,
+  };
 }
 
-/**
- * Mirror of buildAutoBadges() — kept in lockstep so this test exercises the
- * same class-wiring logic the content script applies in the page.
- */
-function buildAutoBadges(
-  verify: any,
-  trust: any,
-  inputState: 'source-only' | 'stale' | 'rendered-match' = 'rendered-match',
-): HTMLElement {
-  const badges = document.createElement('div');
-  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
-
-  const sigBadge = document.createElement('span');
-  const renderedValid = verify.valid && inputState === 'rendered-match';
-  if (renderedValid) {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  } else if (verify.valid) {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_WARNING} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  } else {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  }
-  badges.appendChild(sigBadge);
-
-  const trustBadge = document.createElement('span');
-  const trustClass =
-    trust.indicator === 'green'
-      ? CSS_CLASSES.TRUST_BADGE_TRUSTED
-      : trust.indicator === 'red'
-      ? CSS_CLASSES.TRUST_BADGE_UNTRUSTED
-      : CSS_CLASSES.TRUST_BADGE_UNKNOWN;
-  trustBadge.className = `${CSS_CLASSES.TRUST_BADGE} ${trustClass}`;
-  badges.appendChild(trustBadge);
-
-  return badges;
+function trustShape(overrides: Partial<TrustEvaluation> = {}): TrustEvaluation {
+  return { score: 80, indicator: 'green', inputs: [], ...overrides };
 }
 
-function buildErrorBadges(): HTMLElement {
-  const badges = document.createElement('div');
-  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
-  const sigBadge = document.createElement('span');
-  sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-  badges.appendChild(sigBadge);
-  return badges;
-}
+describe('production content-script UI and lifecycle', () => {
+  let consoleError: jest.SpyInstance;
 
-/**
- * Mirror of autoVerifyPage() — minus the settings load and resolver-chain
- * construction (those are exercised in content-signing-client.test.ts). This
- * isolates the DOM-walking + lib-invocation + badge-insertion logic.
- */
-async function autoVerifyPage(): Promise<void> {
-  const sections = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
-  for (const section of Array.from(sections)) {
-    if (section.nextElementSibling?.classList.contains(AUTO_BADGE_MARKER)) {
-      continue;
-    }
-    try {
-      const verify = await (verifySignedSection as jest.Mock)(section, {
-        keyResolvers: [],
-        domain: 'https://test.example',
-      });
-      const trust = await (evaluateTrustPolicy as jest.Mock)(verify, {
-        personalTrustList: [],
-        trustedDomains: [],
-        directorySubscriptions: [],
-      });
-      const badges = buildAutoBadges(verify, trust);
-      section.parentNode?.insertBefore(badges, section.nextSibling);
-    } catch {
-      const badges = buildErrorBadges();
-      section.parentNode?.insertBefore(badges, section.nextSibling);
-    }
-  }
-}
-
-describe('content script auto-verify (selector and badge wiring)', () => {
   beforeEach(() => {
-    while (document.body.firstChild) document.body.removeChild(document.body.firstChild);
+    document.body.replaceChildren();
     jest.clearAllMocks();
+    resetNavigationState();
+    (global.fetch as jest.Mock).mockReset();
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      url: window.location.href,
+      text: async () => '',
+    });
+    consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
   });
 
-  it('querySelectorAll(signed-section) includes malformed sections for failure reporting', () => {
-    fixture(`
-      <signed-section signature="sig-1" id="s1">a</signed-section>
-      <signed-section id="s2">b</signed-section>
-      <div id="s3">c</div>
-      <signed-section signature="sig-2" id="s4">d</signed-section>
-    `);
-    const found = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
-    expect(found.length).toBe(3);
-    expect(found[0].id).toBe('s1');
-    expect(found[1].id).toBe('s2');
-    expect(found[2].id).toBe('s4');
+  afterEach(() => {
+    consoleError.mockRestore();
   });
 
-  it('calls verifySignedSection for each signed-section on the page', async () => {
-    fixture(`
-      <signed-section signature="sig-1">a</signed-section>
-      <signed-section signature="sig-2">b</signed-section>
-    `);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: true,
-      keyid: 'did:web:example.test',
-    });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 80,
-      indicator: 'green',
-      inputs: [],
-    });
+  it('anchors nested indicators outside the outermost signed section', () => {
+    document.body.innerHTML =
+      '<signed-section signature="outer"><signed-section signature="inner">text</signed-section></signed-section>';
+    const outer = document.querySelector('signed-section')!;
+    const inner = outer.querySelector('signed-section')!;
 
-    await autoVerifyPage();
+    applySectionStatusUI(inner, {
+      verify: verifyShape(),
+      inputState: 'rendered-match',
+      sourceVerified: true,
+      renderedVerified: true,
+      displayValid: true,
+      reason: null,
+    }, trustShape(), null, settings);
 
-    expect(verifySignedSection).toHaveBeenCalledTimes(2);
-    expect(evaluateTrustPolicy).toHaveBeenCalledTimes(2);
+    const badge = document.querySelector(`.${AUTO_BADGE_MARKER}`)!;
+    expect(badge.parentElement).toBe(document.body);
+    expect(badge.previousElementSibling).toBe(outer);
+    expect(outer.querySelector(`.${AUTO_BADGE_MARKER}`)).toBeNull();
   });
 
-  it('passes a serialized origin and leaves verifier debug disabled by default', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: true,
-      keyid: 'did:web:example.test',
-    });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 80,
-      indicator: 'green',
-      inputs: [],
-    });
+  it.each(['stale', 'source-only'] as const)(
+    'shows a warning for cryptographically valid %s results',
+    (inputState) => {
+      document.body.innerHTML = '<signed-section>text</signed-section>';
+      const section = document.querySelector('signed-section')!;
+      applySectionStatusUI(section, {
+        verify: verifyShape({ inputState }),
+        inputState,
+        sourceVerified: true,
+        renderedVerified: false,
+        displayValid: false,
+        reason: inputState === 'stale' ? 'rendered DOM diverged from verified source' : 'rendered DOM not compared',
+      }, trustShape(), null, settings);
 
-    await autoVerifyPage();
+      const badge = document.querySelector(`.${AUTO_BADGE_MARKER}`)!;
+      expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`)).not.toBeNull();
+      expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).toBeNull();
+      expect(badge.getAttribute('aria-label')).toContain(
+        inputState === 'stale' ? 'rendered DOM differs' : 'rendered DOM not compared',
+      );
+    },
+  );
 
-    const [, options] = (verifySignedSection as jest.Mock).mock.calls[0];
-    expect(options.domain).toBe('https://test.example');
-    expect(options.debug).toBeUndefined();
+  it('fails closed through autoVerifyPage when the source snapshot is unavailable', async () => {
+    document.body.innerHTML = '<signed-section signature="live-only">live</signed-section>';
+
+    await autoVerifyPage([], settings);
+
+    const badge = document.querySelector(`.${AUTO_BADGE_MARKER}`)!;
+    expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED}`)).not.toBeNull();
+    expect(verifySignedSection).not.toHaveBeenCalled();
+    expect(badge.getAttribute('aria-label')).toContain('Signature invalid');
   });
 
-  it('applies the verified badge classes when the signature is valid', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: true,
-      keyid: 'did:web:example.test',
+  it('fails closed through autoVerifyPage when source and live identities do not map', async () => {
+    const sourceHTML = '<signed-section profile="htmltrust-signature-v1" signature="source">source</signed-section>';
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      url: window.location.href,
+      text: async () => sourceHTML,
     });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 80,
-      indicator: 'green',
-      inputs: [],
-    });
+    document.body.innerHTML =
+      '<signed-section profile="htmltrust-signature-v1" signature="live">live</signed-section>';
 
-    await autoVerifyPage();
+    await autoVerifyPage([], settings);
 
-    const badges = document.querySelector(`.${AUTO_BADGE_MARKER}`);
-    expect(badges).not.toBeNull();
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`),
-    ).not.toBeNull();
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.TRUST_BADGE_TRUSTED}`),
-    ).not.toBeNull();
+    const badge = document.querySelector(`.${AUTO_BADGE_MARKER}`)!;
+    expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED}`)).not.toBeNull();
+    expect(verifySignedSection).not.toHaveBeenCalled();
   });
 
-  it('applies the unverified badge classes when the signature is invalid', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: false,
-      reason: 'bad-signature',
-    });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 0,
-      indicator: 'red',
-      inputs: [],
-    });
+  it('invalidates a rendered marker after signed content mutation', async () => {
+    document.body.innerHTML = '<signed-section signature="a">text</signed-section>';
+    const section = document.querySelector('signed-section')!;
+    applySectionStatusUI(section, {
+      verify: verifyShape(),
+      inputState: 'rendered-match',
+      sourceVerified: true,
+      renderedVerified: true,
+      displayValid: true,
+      reason: null,
+    }, trustShape(), null, settings);
+    (verifySignedSection as jest.Mock).mockResolvedValue(verifyShape({ inputState: 'stale' }));
+    (evaluateTrustPolicy as jest.Mock).mockResolvedValue(trustShape());
 
-    await autoVerifyPage();
-
-    const badges = document.querySelector(`.${AUTO_BADGE_MARKER}`);
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED}`),
-    ).not.toBeNull();
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.TRUST_BADGE_UNTRUSTED}`),
-    ).not.toBeNull();
-  });
-
-  it('applies the unknown trust class when the indicator is yellow', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: true,
-      keyid: 'did:web:unknown.test',
-    });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 40,
-      indicator: 'yellow',
-      inputs: [],
-    });
-
-    await autoVerifyPage();
-
-    const badges = document.querySelector(`.${AUTO_BADGE_MARKER}`);
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.TRUST_BADGE_UNKNOWN}`),
-    ).not.toBeNull();
-  });
-
-  it('uses a warning badge for source-valid but stale rendered content', () => {
-    const badges = buildAutoBadges(
-      { valid: true, keyid: 'did:web:example.test' },
-      { score: 80, indicator: 'green', inputs: [] },
-      'stale',
+    armSectionMutationInvalidation(
+      section,
+      '<signed-section signature="a">text</signed-section>',
+      'https://example.test/article',
+      'https://example.test/article',
+      [],
+      settings,
     );
+    section.textContent = 'changed';
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(
-      badges.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`),
-    ).not.toBeNull();
-    expect(
-      badges.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`),
-    ).toBeNull();
+    const badge = document.querySelector(`.${AUTO_BADGE_MARKER}`)!;
+    expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`)).not.toBeNull();
+    expect(badge.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).toBeNull();
+    expect(verifySignedSection).toHaveBeenCalled();
   });
 
-  it('inserts an error badge if verification throws', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockRejectedValue(
-      new Error('resolver failed'),
-    );
+  it('resets navigation state and removes old markers before a reload verification', async () => {
+    const fetchMock = global.fetch as jest.Mock;
+    const oldHTML = '<signed-section profile="htmltrust-signature-v1" signature="old">old</signed-section>';
+    const newHTML = '<signed-section profile="htmltrust-signature-v1" signature="new">new</signed-section>';
+    fetchMock.mockResolvedValue({ ok: true, url: window.location.href, text: async () => oldHTML });
+    (verifySignedSection as jest.Mock).mockResolvedValue(verifyShape());
+    (evaluateTrustPolicy as jest.Mock).mockResolvedValue(trustShape());
+    document.body.innerHTML = oldHTML;
+    await autoVerifyPage([], settings);
+    expect(document.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).not.toBeNull();
 
-    await autoVerifyPage();
+    resetNavigationState();
+    expect(document.querySelector(`.${AUTO_BADGE_MARKER}`)).toBeNull();
 
-    const badges = document.querySelector(`.${AUTO_BADGE_MARKER}`);
-    expect(badges).not.toBeNull();
-    expect(
-      badges!.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED}`),
-    ).not.toBeNull();
+    // A new DOM section and response represent the post-reload document. The
+    // verifier must receive the new source slice, never the prior snapshot.
+    fetchMock.mockResolvedValue({ ok: true, url: window.location.href, text: async () => newHTML });
+    document.body.innerHTML = newHTML;
+    await autoVerifyPage([], settings);
+    expect(document.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).not.toBeNull();
+    const calls = (verifySignedSection as jest.Mock).mock.calls;
+    expect(calls[calls.length - 1]?.[0]).toBe(newHTML);
   });
 
-  it('does not double-insert when re-run on the same page', async () => {
-    fixture(`<signed-section signature="sig">x</signed-section>`);
-    (verifySignedSection as jest.Mock).mockResolvedValue({
-      valid: true,
-      keyid: 'did:web:example.test',
-    });
-    (evaluateTrustPolicy as jest.Mock).mockResolvedValue({
-      score: 80,
-      indicator: 'green',
-      inputs: [],
-    });
-
-    await autoVerifyPage();
-    await autoVerifyPage();
-
-    expect(document.querySelectorAll(`.${AUTO_BADGE_MARKER}`).length).toBe(1);
-    // Verification should only happen once thanks to the marker check.
-    expect(verifySignedSection).toHaveBeenCalledTimes(1);
+  it('keeps the production auto badge builder warning-aware', () => {
+    const warning = buildAutoBadges(verifyShape({ inputState: 'stale' }), trustShape());
+    expect(warning.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_WARNING}`)).not.toBeNull();
+    expect(warning.querySelector(`.${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED}`)).toBeNull();
   });
 });

@@ -52,7 +52,7 @@
   },
   "dependencies": {
     "@htmltrust/browser-client": "git+https://github.com/HTMLTrust/htmltrust-browser-client.git#d25c6d3c2d0f4d67483da20853f22e94a11b89cc",
-    "@htmltrust/canonicalization": "https://github.com/HTMLTrust/htmltrust-canonicalization/archive/b0c8f305425de190a7f209ac117d34f88c2b1946.tar.gz",
+    "@htmltrust/canonicalization": "https://github.com/HTMLTrust/htmltrust-canonicalization/archive/5e51040dcaaf50935e245702bdefbc18a1d542ce.tar.gz",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "axios": "^1.9.0",
     "js-sha256": "^0.11.0",
