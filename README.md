@@ -29,7 +29,7 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependencies pin browser client commit `d25c6d3c` and canonicalization commit `5e51040d`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependencies pin browser client commit `39dc873c` and canonicalization commit `5e51040d`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
 
 For a standalone checkout:
 

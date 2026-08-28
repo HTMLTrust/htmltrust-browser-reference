@@ -528,8 +528,8 @@ async function verifySectionWithState(
  * Walk every <signed-section> on the page and verify it locally.
  *
  * Each section is verified independently. A failure on one does not skip
- * the others. Markers are inserted as the next sibling of the section
- * element, keeping extension-owned nodes out of signed content.
+ * the others. Markers are inserted after the outermost signed section,
+ * keeping extension-owned nodes out of signed content even when sections nest.
  *
  * Idempotent: if a section already has an auto-marker sibling, it's skipped.
  * This protects against re-runs (e.g. the script being injected twice on a
