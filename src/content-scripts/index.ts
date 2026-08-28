@@ -40,7 +40,7 @@ import {
   observeSignedSection,
   outermostSignedSection,
   SIGNED_SECTION_SELECTOR,
-  sourceElementForSnapshot,
+  sourceHTMLForSnapshot,
   type NavigationSnapshot,
 } from '../core/content/navigation-lifecycle';
 import { PlatformAdapter, MessageContext } from '../platforms/common';
@@ -447,7 +447,8 @@ async function fetchPristineSignedSections(settings: Settings): Promise<{
 
 async function verifySectionWithState(
   section: Element,
-  sourceElement: Element | null,
+  sourceHTML: string | null,
+  sourceDocumentUrl: string | null,
   sourceBaseUrl: string | null,
   resolverChain: KeyResolver[],
   settings: Settings,
@@ -458,11 +459,12 @@ async function verifySectionWithState(
     keyResolvers: resolverChain,
     domain: origin,
     origin,
+    documentUrl: sourceDocumentUrl ?? window.location.href,
     baseUrl: window.location.href,
     debug: settings.developerDebugLogging === true,
   };
 
-  if (!sourceElement) {
+  if (!sourceHTML) {
     // A live DOM is not an accepted Layer-1 source. Page script can construct
     // or rewrite it after navigation, so treating it as verified would make a
     // valid indicator attacker-controlled.
@@ -489,7 +491,7 @@ async function verifySectionWithState(
     };
   }
 
-  const sourceVerify = await verifySignedSection(sourceElement, {
+  const sourceVerify = await verifySignedSection(sourceHTML, {
     ...options,
     baseUrl: sourceBaseUrl ?? options.baseUrl,
     renderedBaseUrl: documentBaseUrl(document, window.location.href),
@@ -612,7 +614,8 @@ async function autoVerifyPage(
       const match = mapped.matches.find((candidate) => candidate.live === section);
       const run = await verifySectionWithState(
         section,
-        mapped.complete ? (match ? sourceElementForSnapshot(match.source) : null) : null,
+        mapped.complete ? (match ? sourceHTMLForSnapshot(match.source) : null) : null,
+        fetchedSnapshot?.url ?? null,
         fetchedSnapshot?.baseUrl ?? null,
         resolverChain,
         settings,
@@ -656,7 +659,8 @@ async function autoVerifyPage(
       pageVerificationBySection.set(section, pageVerification);
       armSectionMutationInvalidation(
         section,
-        mapped.complete ? (match ? sourceElementForSnapshot(match.source) : null) : null,
+        mapped.complete ? (match ? sourceHTMLForSnapshot(match.source) : null) : null,
+        fetchedSnapshot?.url ?? null,
         fetchedSnapshot?.baseUrl ?? null,
         resolverChain,
         settings,
@@ -685,7 +689,7 @@ async function autoVerifyPage(
       };
       pageVerifications.push(pageVerification);
       pageVerificationBySection.set(section, pageVerification);
-      armSectionMutationInvalidation(section, null, null, resolverChain, settings);
+      armSectionMutationInvalidation(section, null, null, null, resolverChain, settings);
     }
     i++;
   }
@@ -786,7 +790,8 @@ function clearSectionStatusUI(section: Element): void {
 /** Re-verify a section after live content changes, against its frozen source. */
 function armSectionMutationInvalidation(
   section: Element,
-  sourceElement: Element | null,
+  sourceHTML: string | null,
+  sourceDocumentUrl: string | null,
   sourceBaseUrl: string | null,
   resolverChain: KeyResolver[],
   settings: Settings,
@@ -810,7 +815,8 @@ function armSectionMutationInvalidation(
       try {
         const run = await verifySectionWithState(
           changedSection,
-          sourceElement,
+          sourceHTML,
+          sourceDocumentUrl,
           sourceBaseUrl,
           currentResolverChain.length ? currentResolverChain : resolverChain,
           activeSettings,

@@ -1,5 +1,12 @@
 # HTMLTrust Browser Reference
 
+- Maintainer: Jason Grey
+- Updated: 2026-08-28
+- Version: 0.1.0, draft v1 profile
+- Status: Chromium reference implementation; Firefox and Safari adapters pending
+- For: extension contributors and browser implementers
+- Reading time: 8 minutes
+
 Reference browser extension for validating HTMLTrust `<signed-section>` elements in a browser.
 
 The extension verifies signatures locally, shows a status marker beside each signed section, and exposes details in the popup. It is a companion to the [HTMLTrust specification](https://github.com/HTMLTrust/htmltrust-spec).
@@ -12,7 +19,7 @@ Readers: contributors and implementers. The normal workflow is:
 2. Run tests and type checking.
 3. Build the extension for the browser you use.
 
-After each page load or same-document navigation, the content script refetches the current HTTPS URL (using the browser HTTP cache when available). It parses that response with the browser's HTML parser and freezes signed-section snapshots. It verifies those snapshots, then compares each one with the current live element. If page code changes a signed element, the extension marks it as stale and re-verifies it. A refetch can differ from the original response on personalized, time-varying, or service-worker-controlled pages. Status markers are siblings of `<signed-section>`, so extension UI cannot become signed content.
+After each page load or same-document navigation, the content script refetches the current HTTPS URL using the browser HTTP cache when available. It retains each exact signed-section source slice and a parser-owned DOM element. It verifies the source against the final response URL, then compares it with the live element. If page code changes a signed element, the extension marks it as stale and re-verifies it. A refetch can differ from the original response on personalized, time-varying, or service-worker-controlled pages. Status markers are siblings of `<signed-section>`, so extension UI cannot become signed content.
 
 ## Quick start
 
@@ -22,7 +29,7 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependency is pinned to browser-client commit `a846e3d971ab93bdcc8a9f599fb1987828344983`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependencies pin browser client commit `d25c6d3c` and canonicalization commit `b0c8f305`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
 
 For a standalone checkout:
 
@@ -67,7 +74,7 @@ container with:
 ```
 
 The script copies this checkout into the container, installs the pinned browser
-client from Git, runs 63 extension tests, checks types and lint, then builds all
+client from Git, runs 64 extension tests, checks types and lint, then builds all
 three browser packages. Generated files stay outside the checkout.
 
 ### Build
@@ -92,7 +99,7 @@ Use the matching `dev:firefox` or `dev:safari` command for another target. Reloa
 
 `src/core/content/navigation-lifecycle.ts` owns navigation state:
 
-- `captureNavigationSnapshot` parses refetched HTML and freezes source sections.
+- `captureNavigationSnapshot` retains exact source slices, parser-owned elements, the final response URL, and the document base URL.
 - `mapSnapshotToLiveSections` pairs source sections with live elements by signed attributes, so page reordering does not pair one signature with another.
 - `observeSignedSection` watches only the live signed element. Mutations trigger re-verification against the immutable source section. History changes and replacement of signed sections trigger a fresh page refetch.
 - The content script inserts markers beside the signed element. The marker, tooltip, and vote controls are outside signed content.
@@ -184,4 +191,4 @@ Contributions are welcome. Open a pull request with the tests or conformance
 vectors that demonstrate the change. Keep repository discussion focused on
 the protocol and implementation behavior.
 
-If this work is useful to you and you'd like to support it, see [GitHub Sponsors](https://github.com/sponsors/jt55401) or the other channels in [`.github/FUNDING.yml`](.github/FUNDING.yml).
+If this work is useful and you want to support it, see [GitHub Sponsors](https://github.com/sponsors/jt55401) or the other channels in [`.github/FUNDING.yml`](.github/FUNDING.yml).

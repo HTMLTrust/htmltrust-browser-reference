@@ -23,6 +23,8 @@ const IDENTITY_ATTRIBUTES = [
 export interface SignedSectionSnapshot {
   readonly index: number;
   readonly identity: string;
+  /** Exact source slice from the response body, never DOM outerHTML. */
+  readonly sourceHTML: string;
   readonly outerHTML: string;
 }
 
@@ -30,6 +32,75 @@ export interface SignedSectionSnapshot {
 // still lets the content script verify the exact parser tree without
 // serializing nested sections and reparsing them through a different path.
 const sourceElements = new WeakMap<SignedSectionSnapshot, Element>();
+
+/** Extract balanced source slices without letting DOMParser rewrite them. */
+export function extractRawSignedSections(html: string): string[] {
+  const found: Array<{ start: number; end: number }> = [];
+  const openSections: number[] = [];
+  const rawElements = new Set(['script', 'style', 'textarea', 'title', 'iframe']);
+  let scan = 0;
+  let rawName: string | null = null;
+
+  const tagEnd = (start: number): number => {
+    let quote = '';
+    for (let index = start + 1; index < html.length; index++) {
+      const character = html[index];
+      if (quote) {
+        if (character === quote) quote = '';
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === '>') {
+        return index + 1;
+      }
+    }
+    return -1;
+  };
+
+  while (scan < html.length) {
+    const start = html.indexOf('<', scan);
+    if (start < 0) break;
+    if (rawName) {
+      if (!new RegExp(`^</\\s*${rawName}\\b`, 'i').test(html.slice(start))) {
+        scan = start + 1;
+        continue;
+      }
+    }
+    if (html.startsWith('<!--', start)) {
+      const end = html.indexOf('-->', start + 4);
+      if (end < 0) break;
+      scan = end + 3;
+      continue;
+    }
+    const end = tagEnd(start);
+    if (end < 0) break;
+    const token = html.slice(start, end);
+    if (/^<!/.test(token)) {
+      scan = end;
+      continue;
+    }
+    const names = /^<\/\s*([a-z][a-z0-9-]*)|^<\s*([a-z][a-z0-9-]*)/i.exec(token);
+    if (!names) {
+      scan = end;
+      continue;
+    }
+    const name = (names[1] ?? names[2]).toLowerCase();
+    const closing = /^<\//.test(token);
+    if (rawName) {
+      rawName = null;
+    } else if (closing && name === 'signed-section') {
+      const sectionStart = openSections.pop();
+      if (sectionStart !== undefined) found.push({ start: sectionStart, end });
+    } else if (!closing && name === 'signed-section' && !/\/\s*>$/.test(token)) {
+      openSections.push(start);
+    } else if (!closing && rawElements.has(name) && !/\/\s*>$/.test(token)) {
+      rawName = name;
+    }
+    scan = end;
+  }
+  return found
+    .sort((left, right) => left.start - right.start)
+    .map(({ start, end }) => html.slice(start, end));
+}
 
 export interface NavigationSnapshot {
   readonly url: string;
@@ -63,6 +134,7 @@ export function captureNavigationSnapshot(
   }
 
   const parsed = new DOMParser().parseFromString(html, 'text/html');
+  const sourceSlices = extractRawSignedSections(html);
   const baseElement = parsed.querySelector('base[href]');
   let baseUrl = url;
   if (baseElement) {
@@ -79,6 +151,7 @@ export function captureNavigationSnapshot(
       const snapshot = {
         index,
         identity: sectionIdentity(section),
+        sourceHTML: sourceSlices[index] ?? '',
         outerHTML: section.outerHTML,
       };
       const frozen = Object.freeze(snapshot);
@@ -99,6 +172,11 @@ export function captureNavigationSnapshot(
 /** Retrieve the parser-owned source element for internal verification. */
 export function sourceElementForSnapshot(snapshot: SignedSectionSnapshot): Element | null {
   return sourceElements.get(snapshot) ?? null;
+}
+
+/** Retrieve the exact source slice captured for a snapshot section. */
+export function sourceHTMLForSnapshot(snapshot: SignedSectionSnapshot): string | null {
+  return snapshot.sourceHTML || null;
 }
 
 /**
