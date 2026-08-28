@@ -29,6 +29,7 @@ import {
 import { AuthService } from "../core/auth";
 import { ContentSigningClient } from "../core/api";
 import { ContentProcessor } from "../core/content";
+import { extractRawSignedSections } from "../core/content/navigation-lifecycle";
 import { PlatformAdapter, MessageContext } from "../platforms/common";
 
 // Import platform-specific adapter
@@ -72,6 +73,49 @@ function createVerifierFetch(): typeof fetch {
       redirect: "error",
     });
   };
+}
+
+type PristineSection = {
+  sectionHtml: string;
+  documentUrl: string;
+  baseUrl: string;
+};
+
+/** Fetch the response body so popup verification never signs live DOM HTML. */
+async function fetchPristineSection(url: string): Promise<PristineSection | null> {
+  const requested = new URL(url);
+  if (requested.protocol !== 'https:') return null;
+  const response = await fetch(requested.href, {
+    cache: 'force-cache',
+    credentials: 'include',
+    referrer: '',
+    referrerPolicy: 'no-referrer',
+    redirect: 'error',
+  });
+  if (!response.ok) return null;
+  const documentUrl = response.url || requested.href;
+  const finalUrl = new URL(documentUrl);
+  if (finalUrl.protocol !== 'https:' || finalUrl.origin !== requested.origin) return null;
+  const html = await response.text();
+  const sectionHtml = extractRawSignedSections(html)[0];
+  if (!sectionHtml) return null;
+
+  // Service workers do not expose DOMParser in every target. The response URL
+  // remains the correct base when no document <base> can be parsed here; the
+  // content-script path computes a parser-backed base for normal page loads.
+  let baseUrl = documentUrl;
+  if (typeof DOMParser !== 'undefined') {
+    const parsed = new DOMParser().parseFromString(html, 'text/html');
+    const base = parsed.querySelector('base[href]');
+    if (base) {
+      try {
+        baseUrl = new URL(base.getAttribute('href') ?? '', documentUrl).href;
+      } catch {
+        baseUrl = documentUrl;
+      }
+    }
+  }
+  return { sectionHtml, documentUrl, baseUrl };
 }
 
 /**
@@ -251,23 +295,13 @@ async function getVerificationStatus(url: string): Promise<any> {
  */
 async function verifyContent(url: string): Promise<any> {
   try {
-    const currentTab = await platformAdapter.getCurrentTab();
-
-    // Step 1: pull the signed-section's outerHTML out of the page. The lib
-    // accepts an HTML fragment string, so we don't need to round-trip a
-    // full DOM Element across the messaging boundary. Returns null when
-    // the page has no signed-section, which we map to a clear failure.
-    // executeScript wraps the body in a function, so the body needs an
-    // explicit top-level return (not just an IIFE expression).
-    const sectionHtml = await platformAdapter.executeScript<string | null>(
-      currentTab.id,
-      `const section = document.querySelector('signed-section[signature]');
-       return section ? section.outerHTML : null;`,
-    );
+    // Step 1: fetch the response body. DOM outerHTML is a repaired
+    // serialization and cannot preserve source-level parser ambiguities.
+    const pristine = await fetchPristineSection(url);
 
     let verificationResult: VerificationResult;
 
-    if (!sectionHtml) {
+    if (!pristine) {
       verificationResult = {
         verified: false,
         reason: "No signed-section found on this page",
@@ -286,11 +320,14 @@ async function verifyContent(url: string): Promise<any> {
         fetch: createVerifierFetch(),
       });
 
-      const verify = await verifySignedSection(sectionHtml, {
+      const verify = await verifySignedSection(pristine.sectionHtml, {
         keyResolvers: resolverChain,
-        domain: serializedOrigin(url),
+        domain: serializedOrigin(pristine.documentUrl),
+        origin: serializedOrigin(pristine.documentUrl),
+        documentUrl: pristine.documentUrl,
+        baseUrl: pristine.baseUrl,
         debug: settings.developerDebugLogging === true,
-      });
+      } as Parameters<typeof verifySignedSection>[1]);
 
       // Best-effort author name lookup. The author DB is server-side and
       // optional; if we can't fetch it (the keyid isn't a server URL or

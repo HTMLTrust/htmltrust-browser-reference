@@ -6,6 +6,7 @@ import {
   mutationTouchesDocumentBase,
   outermostSignedSection,
   sourceElementForSnapshot,
+  sourceHTMLForSnapshot,
   SIGNED_SECTION_SELECTOR,
 } from './navigation-lifecycle';
 
@@ -19,6 +20,9 @@ describe('navigation lifecycle snapshots', () => {
 
     expect(snapshot.sections).toHaveLength(1);
     expect(snapshot.sections[0].outerHTML).toContain('<p>source</p>');
+    expect(sourceHTMLForSnapshot(snapshot.sections[0])).toBe(
+      '<signed-section signature="a" keyid="k" algorithm="ed25519" content-hash="h"><p>source</p></signed-section>',
+    );
     expect(Object.isFrozen(snapshot)).toBe(true);
     expect(Object.isFrozen(snapshot.sections)).toBe(true);
     expect(Object.isFrozen(snapshot.sections[0])).toBe(true);
@@ -33,6 +37,16 @@ describe('navigation lifecycle snapshots', () => {
     expect(snapshot.baseUrl).toBe('https://cdn.example/assets/');
     expect(snapshot.sections.map((section) => section.identity.includes('signature=')).every(Boolean)).toBe(true);
     expect(sourceElementForSnapshot(snapshot.sections[0])?.querySelector('signed-section')?.getAttribute('signature')).toBe('inner');
+    expect(sourceHTMLForSnapshot(snapshot.sections[0])).toContain('<signed-section signature="outer">');
+    expect(sourceHTMLForSnapshot(snapshot.sections[0])).toContain('<signed-section signature="inner">inner</signed-section>');
+  });
+
+  it('retains source ambiguities beside the repaired parser node', () => {
+    const html = '<signed-section profile="htmltrust-signature-v1" profile="duplicate" signature="a"></signed-section>';
+    const snapshot = captureNavigationSnapshot(html, 'https://example.test/article');
+
+    expect(sourceHTMLForSnapshot(snapshot.sections[0])).toBe(html);
+    expect(sourceElementForSnapshot(snapshot.sections[0])?.getAttribute('profile')).toBe('htmltrust-signature-v1');
   });
 
   it('maps reordered live sections by signed identity rather than array position', () => {
