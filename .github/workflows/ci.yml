@@ -20,26 +20,13 @@ jobs:
           persist-credentials: false
           path: htmltrust-browser-reference
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: HTMLTrust/htmltrust-browser-client
-          ref: 09e8c7552c8111a2cedd83fa45f4ffe3811bf5ca
-          persist-credentials: false
-          path: htmltrust-browser-client
-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
-      - name: Build browser client dependency
-        working-directory: htmltrust-browser-client
-        run: |
-          npm ci --ignore-scripts
-          npm run build
-
       - name: Install dependencies
         working-directory: htmltrust-browser-reference
-        run: npm ci --ignore-scripts
+        run: npm ci --ignore-scripts=false
 
       - name: Lint
         working-directory: htmltrust-browser-reference

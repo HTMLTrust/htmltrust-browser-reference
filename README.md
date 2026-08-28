@@ -8,10 +8,9 @@ The extension verifies signatures locally, shows a status marker beside each sig
 
 Readers: contributors and implementers. The normal workflow is:
 
-1. Build the sibling browser-client package.
-2. Install this repository.
-3. Run tests and type checking.
-4. Build the extension for the browser you use.
+1. Install this repository.
+2. Run tests and type checking.
+3. Build the extension for the browser you use.
 
 After each page load or same-document navigation, the content script refetches the current HTTPS URL (using the browser HTTP cache when available). It parses that response with the browser's HTML parser and freezes signed-section snapshots. It verifies those snapshots, then compares each one with the current live element. If page code changes a signed element, the extension marks it as stale and re-verifies it. A refetch can differ from the original response on personalized, time-varying, or service-worker-controlled pages. Status markers are siblings of `<signed-section>`, so extension UI cannot become signed content.
 
@@ -23,29 +22,34 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-Use this checkout layout. The browser-reference package has a local dependency on the browser-client package during development:
+The published dependency is pinned to browser-client commit `698a6fba7ada94ea1e26348dda0e1c87e8dd8fc9`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
 
-```
-htmltrust-workspace/
-├── htmltrust-browser-client/
-└── htmltrust-browser-reference/
-```
-
-Create both checkouts and build the client first:
+For a standalone checkout:
 
 ```sh
-mkdir htmltrust-workspace
-cd htmltrust-workspace
-git clone https://github.com/HTMLTrust/htmltrust-browser-client.git
 git clone https://github.com/HTMLTrust/htmltrust-browser-reference.git
-cd htmltrust-browser-client
+cd htmltrust-browser-reference
+npm ci --ignore-scripts=false
+```
+
+The explicit flag lets the pinned browser-client dependency build its
+`dist/` directory even when npm is configured globally to skip lifecycle
+scripts.
+
+For coordinated local development, clone the sibling client, build it, then replace the installed package without changing `package.json` or `package-lock.json`:
+
+```sh
+git clone https://github.com/HTMLTrust/htmltrust-browser-client.git ../htmltrust-browser-client
+cd ../htmltrust-browser-client
 npm ci --ignore-scripts
 npm run build
 cd ../htmltrust-browser-reference
-npm ci --ignore-scripts
+npm ci --ignore-scripts=false
+npm install --no-save --package-lock=false ../htmltrust-browser-client
 ```
 
-The reference repository CI pins the client to commit `09e8c7552c8111a2cedd83fa45f4ffe3811bf5ca`. Check out that revision when reproducing CI exactly.
+The local override is disposable. Run `npm ci --ignore-scripts=false` again to
+restore the pinned commit.
 
 ### Test and type-check
 
@@ -62,10 +66,9 @@ container with:
 ./scripts/test-in-docker.sh
 ```
 
-The script copies both sibling repositories into the container, builds the
-browser client, runs 60 extension tests, checks types and lint, then builds the
-Chromium, Firefox, and Safari packages. Generated files stay outside the
-checkout.
+The script copies this checkout into the container, installs the pinned browser
+client from Git, runs 60 extension tests, checks types and lint, then builds all
+three browser packages. Generated files stay outside the checkout.
 
 ### Build
 
