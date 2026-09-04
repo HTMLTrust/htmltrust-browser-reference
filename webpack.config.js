@@ -36,6 +36,10 @@ module.exports = {
     filename: '[name].js',
     clean: true,
   },
+  // The generic 244 KiB hint cannot express per-entry budgets. Every
+  // production build runs scripts/check-bundle-size.js with exact limits for
+  // all four JavaScript entrypoints and rejects unexpected chunks.
+  performance: false,
   module: {
     rules: [
       {

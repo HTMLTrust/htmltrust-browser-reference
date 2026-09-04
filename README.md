@@ -29,7 +29,12 @@ After each page load or same-document navigation, the content script refetches t
 - npm
 - Chromium, Firefox, or Safari for loading a built extension
 
-The published dependencies pin browser client commit `39dc873c` and canonicalization commit `5e51040d`. A sibling browser-client checkout is optional. Use one when developing both repositories together.
+The published dependencies pin browser client commit
+`70c5ddb6ed23c06c0b1c46d5284618fb99a28aac` and canonicalization commit
+`760593d4a02e9fffa56dc4d002eb52ab2ade1b49`. These are the revisions recorded
+in `package.json` and `package-lock.json`; update both files together when the
+release revision changes. A sibling browser-client checkout is optional. Use
+one when developing both repositories together.
 
 For a standalone checkout:
 
@@ -64,7 +69,12 @@ restore the pinned commit.
 npm test -- --runInBand
 npm run typecheck
 npm run lint
+npm run build:chromium
 ```
+
+The last command is a clean verification build for the default supported
+runtime, Chromium. `npm run build:all` builds and archives all three packaging
+targets.
 
 Tests use jsdom for DOM behavior. Run the complete check in a Node 22
 container with:
@@ -91,7 +101,18 @@ Build one browser with `npm run build:chromium`, `npm run build:firefox`, or `np
 npm run build:all
 ```
 
-The unpacked extension is written to `build/<browser>/`. For Chromium, open `chrome://extensions/`, enable Developer mode, choose **Load unpacked**, and select `build/chromium/`.
+The unpacked extension is written to `build/<browser>/`, with a zip archive in
+`build/`. Chromium is the implemented runtime adapter. Firefox and Safari
+currently have packaging targets and manifests, but their runtime adapters are
+pending, so those builds do not claim working extension support in those
+browsers. For Chromium, open `chrome://extensions/`, enable Developer mode,
+choose **Load unpacked**, and select `build/chromium/`.
+
+Each production build enforces byte budgets for the shipped JavaScript:
+244 KiB each for `background.js` and `content.js`, 215 KiB for `popup.js`, and
+230 KiB for `options.js`. Unexpected JavaScript chunks fail the build because
+the manifests would not load them. After a Chromium build, rerun the gate
+alone with `npm run check:bundle`.
 
 ### Development
 
@@ -108,9 +129,24 @@ Use the matching `dev:firefox` or `dev:safari` command for another target. Reloa
 - `captureNavigationSnapshot` retains exact source slices, parser-owned elements, the final response URL, and the document base URL.
 - `mapSnapshotToLiveSections` pairs source sections with live elements by signed attributes, so page reordering does not pair one signature with another.
 - `observeSignedSection` watches only the live signed element. Mutations trigger re-verification against the immutable source section. History changes and replacement of signed sections trigger a fresh page refetch.
-- The content script inserts markers beside the outermost signed element. The marker, tooltip, and vote controls are outside signed content, including when sections are nested.
+- The content script inserts a marker beside the outermost signed element. The marker stays outside signed content, including when sections are nested.
 
 The popup receives copied result records. It cannot mutate the content script's verification cache.
+The content script is the only verification entry point. It sends an aggregate
+validity bit to the service worker after each page run or signed-content
+mutation; the service worker uses that result for the toolbar badge.
+
+## Trust directory policy
+
+Open **Options**, add a directory, choose a weight from 0 to 1, and leave the
+subscription disabled until you want it consulted. The extension stores these
+rows in browser storage. The content verifier queries each enabled row at
+`GET /signers/{id}/reputation`; the page marker and popup
+show cryptographic validity separately from the resulting directory trust.
+Only the signer identifier is sent to a configured HTTPS directory. Invalid
+URLs and weights are rejected before settings are saved. A timeout, malformed
+response, unavailable directory, or conflicting result leaves the other policy
+inputs visible and does not turn a valid signature into an invalid one.
 
 ## Architecture
 

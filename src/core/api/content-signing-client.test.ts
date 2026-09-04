@@ -1,109 +1,26 @@
-/**
- * Tests for ContentSigningClient — focused on the local-verification migration.
- *
- * Asserts:
- *   1. verifySignedSectionLocal() delegates to @htmltrust/browser-client's
- *      verifySignedSection() and forwards the configured resolver chain. This
- *      is the spec §3.1 path; the assertion is the load-bearing one for the
- *      migration.
- *   2. The deprecated verifyContent() does NOT make a network call and returns
- *      a structured { valid: false } failure. This guards against accidental
- *      regression to server-side verification.
- *   3. setTrustDirectories() rebuilds the resolver chain.
- */
-
-// The library is mocked at module level so we can assert call arguments
-// without instantiating the real SubtleCrypto-backed verifier.
-jest.mock('@htmltrust/browser-client', () => {
-  const mockResolver = { name: 'mock-resolver' };
-  return {
-    verifySignedSection: jest.fn(),
-    defaultResolverChain: jest.fn(() => [mockResolver]),
-    evaluateTrustPolicy: jest.fn(),
-  };
-});
-
-import * as browserClient from '@htmltrust/browser-client';
 import { ContentSigningClient } from './content-signing-client';
+import type { JsonHttpClient } from './json-http-client';
+import { ERROR_CODES } from '../common/constants';
 
-describe('ContentSigningClient — local verification (spec §3.1)', () => {
+function jsonResponse(status: number, data: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: jest.fn().mockResolvedValue(data === undefined ? '' : JSON.stringify(data)),
+  } as unknown as Response;
+}
+
+const author = {
+  id: 'author-1',
+  name: 'Alice',
+  keyType: 'HUMAN' as const,
+  createdAt: '2026-01-01T00:00:00.000Z',
+  updatedAt: '2026-01-01T00:00:00.000Z',
+};
+
+describe('ContentSigningClient', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (browserClient.defaultResolverChain as jest.Mock).mockReturnValue([
-      { name: 'mock-resolver' },
-    ]);
-  });
-
-  describe('constructor', () => {
-    it('builds a resolver chain from configured trust directories', () => {
-      const directories = ['https://dir-a.example/', 'https://dir-b.example/'];
-      new ContentSigningClient({
-        baseUrl: 'https://api.example/',
-        trustDirectories: directories,
-      });
-      expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
-        directories,
-        fetch: expect.any(Function),
-      });
-    });
-
-    it('builds a resolver chain with an empty list when no directories are provided', () => {
-      new ContentSigningClient({ baseUrl: 'https://api.example/' });
-      expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
-        directories: [],
-        fetch: expect.any(Function),
-      });
-    });
-  });
-
-  describe('verifySignedSectionLocal', () => {
-    it('delegates to verifySignedSection with the configured resolver chain', async () => {
-      const fakeResult = { valid: true, keyid: 'k1', reason: undefined };
-      (browserClient.verifySignedSection as jest.Mock).mockResolvedValueOnce(
-        fakeResult,
-      );
-
-      const client = new ContentSigningClient({
-        baseUrl: 'https://api.example/',
-        trustDirectories: ['https://dir.example/'],
-      });
-
-      const section = '<signed-section signature="sig"></signed-section>';
-      const result = await client.verifySignedSectionLocal({
-        section,
-        domain: 'https://example.test',
-      });
-
-      expect(result).toBe(fakeResult);
-      expect(browserClient.verifySignedSection).toHaveBeenCalledTimes(1);
-      const [arg0, arg1] = (browserClient.verifySignedSection as jest.Mock).mock
-        .calls[0];
-      expect(arg0).toBe(section);
-      expect(arg1.domain).toBe('https://example.test');
-      // The resolver chain must be the one the constructor built.
-      expect(arg1.keyResolvers).toEqual(client.getResolverChain());
-    });
-
-    it('honors caller-supplied resolver chain over the configured default', async () => {
-      (browserClient.verifySignedSection as jest.Mock).mockResolvedValueOnce({
-        valid: false,
-      });
-
-      const client = new ContentSigningClient({
-        baseUrl: 'https://api.example/',
-        trustDirectories: ['https://dir.example/'],
-      });
-
-      const customChain = [{ name: 'custom' }] as any;
-      await client.verifySignedSectionLocal({
-        section: '<signed-section></signed-section>',
-        keyResolvers: customChain,
-      });
-
-      const [, arg1] = (browserClient.verifySignedSection as jest.Mock).mock
-        .calls[0];
-      expect(arg1.keyResolvers).toBe(customChain);
-    });
   });
 
   describe('verifyContent (deprecated server endpoint)', () => {
@@ -112,10 +29,11 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
         baseUrl: 'https://api.example/',
       });
 
-      // Spy on the internal axios client to confirm it is never used for
+      // Spy on the internal HTTP client to confirm it is never used for
       // verification. If a regression reintroduces a server call, this fails.
-      const post = jest.spyOn((client as any).client, 'post');
-      const get = jest.spyOn((client as any).client, 'get');
+      const internalClient = (client as unknown as { client: JsonHttpClient }).client;
+      const post = jest.spyOn(internalClient, 'post');
+      const get = jest.spyOn(internalClient, 'get');
 
       const result = await client.verifyContent(
         'sha256-...',
@@ -131,21 +49,71 @@ describe('ContentSigningClient — local verification (spec §3.1)', () => {
     });
   });
 
-  describe('setTrustDirectories', () => {
-    it('rebuilds the resolver chain when directories change', () => {
-      const client = new ContentSigningClient({
-        baseUrl: 'https://api.example/',
-        trustDirectories: ['https://old.example/'],
-      });
-      (browserClient.defaultResolverChain as jest.Mock).mockClear();
+  describe('typed API response contracts', () => {
+    const originalFetch = globalThis.fetch;
 
-      const next = ['https://new-a.example/', 'https://new-b.example/'];
-      client.setTrustDirectories(next);
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      jest.useRealTimers();
+    });
 
-      expect(browserClient.defaultResolverChain).toHaveBeenCalledWith({
-        directories: next,
-        fetch: expect.any(Function),
+    it('sends configured auth headers and encodes list query parameters', async () => {
+      globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, {
+        authors: [author],
+        pagination: { total: 1, pages: 1, page: 2, limit: 10 },
+      }));
+      const client = new ContentSigningClient({ baseUrl: 'https://api.example/v1' });
+      client.setApiKey('author-secret', 'author');
+
+      await client.listAuthors('Alice Smith', 'HUMAN', 2, 10);
+
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        'https://api.example/v1/authors?name=Alice+Smith&keyType=HUMAN&page=2&limit=10',
+        expect.objectContaining({
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-AUTHOR-API-KEY': 'author-secret',
+          },
+          credentials: 'omit',
+        }),
+      );
+    });
+
+    it('maps non-success responses to the public auth error contract', async () => {
+      globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(403, { message: 'Forbidden' }));
+      const client = new ContentSigningClient({ baseUrl: 'https://api.example/v1' });
+
+      await expect(client.getAuthor('author-1')).rejects.toMatchObject({
+        code: ERROR_CODES.AUTH_ERROR,
+        message: 'Forbidden',
       });
+    });
+
+    it('rejects malformed successful responses at the typed boundary', async () => {
+      globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { id: 'author-1' }));
+      const client = new ContentSigningClient({ baseUrl: 'https://api.example/v1' });
+
+      await expect(client.getAuthor('author-1')).rejects.toMatchObject({
+        code: ERROR_CODES.UNKNOWN_ERROR,
+        message: 'Failed to get author with ID author-1',
+      });
+    });
+
+    it('maps an aborted request to the public unknown-error contract', async () => {
+      jest.useFakeTimers();
+      globalThis.fetch = jest.fn((_input, init) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      }));
+      const client = new ContentSigningClient({ baseUrl: 'https://api.example/v1', timeout: 25 });
+
+      const request = client.getAuthor('author-1');
+      const rejection = expect(request).rejects.toMatchObject({
+        code: ERROR_CODES.UNKNOWN_ERROR,
+        message: 'Failed to get author with ID author-1',
+      });
+      await jest.advanceTimersByTimeAsync(25);
+      await rejection;
     });
   });
 });

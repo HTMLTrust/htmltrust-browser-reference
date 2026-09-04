@@ -7,6 +7,8 @@ import {
   MessageHandlers,
   Tab,
   NotificationOptions,
+  ExtensionMessage,
+  isExtensionMessage,
 } from '../common/platform-adapter';
 import { StorageInterface, BaseStorage } from '../../core/storage';
 
@@ -79,6 +81,29 @@ class ChromiumStorage extends BaseStorage {
   }
 }
 
+function trustedExtensionPageContext(sender: chrome.runtime.MessageSender): MessageContext | undefined {
+  if (!sender.id || sender.id !== chrome.runtime.id || typeof sender.url !== 'string') return undefined;
+  try {
+    const url = new URL(sender.url);
+    if (url.protocol !== 'chrome-extension:' || url.hostname !== chrome.runtime.id) return undefined;
+    if (url.pathname === '/popup.html') return MessageContext.POPUP;
+    if (url.pathname === '/options.html') return MessageContext.OPTIONS;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveMessageContext(
+  _message: ExtensionMessage,
+  sender: chrome.runtime.MessageSender,
+): MessageContext {
+  const extensionPageContext = trustedExtensionPageContext(sender);
+  if (extensionPageContext) return extensionPageContext;
+  if (sender.tab) return MessageContext.CONTENT;
+  return MessageContext.BACKGROUND;
+}
+
 /**
  * Chromium platform adapter implementation
  */
@@ -122,20 +147,14 @@ export class ChromiumAdapter implements PlatformAdapter {
    */
   registerMessageListeners(handlers: MessageHandlers): void {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      // Determine which handler should process this message. The popup and
-      // options pages tag their outgoing messages with an explicit context
-      // (popup / options); we honor that first. We only fall back to the
-      // `sender.tab` heuristic for content scripts that didn't bother
-      // tagging — without this ordering, the options page (which runs in a
-      // real tab via open_in_tab: true) would be misrouted as CONTENT.
-      let context: MessageContext;
-      if (message.context) {
-        context = message.context;
-      } else if (sender.tab) {
-        context = MessageContext.CONTENT;
-      } else {
-        context = MessageContext.BACKGROUND;
+      if (!isExtensionMessage(message)) {
+        sendResponse({ error: 'Invalid extension message' });
+        return false;
       }
+      // Route privileged extension pages from browser-provided sender data.
+      // The message's context field is only transport metadata and never
+      // grants access to popup or options handlers.
+      const context = resolveMessageContext(message, sender);
 
       // Get the handler for the context
       const handler = handlers[context];
@@ -147,8 +166,8 @@ export class ChromiumAdapter implements PlatformAdapter {
       // Handle the message
       handler(message)
         .then(sendResponse)
-        .catch((error) => {
-          sendResponse({ error: error.message });
+        .catch((error: unknown) => {
+          sendResponse({ error: error instanceof Error ? error.message : 'Message handler failed' });
         });
 
       // Return true to indicate that the response will be sent asynchronously
@@ -162,7 +181,7 @@ export class ChromiumAdapter implements PlatformAdapter {
    * @param message The message to send
    * @returns A promise that resolves with the response
    */
-  async sendMessage<T = any>(context: MessageContext, message: any): Promise<T> {
+  async sendMessage<T = unknown>(context: MessageContext, message: ExtensionMessage): Promise<T> {
     return new Promise((resolve, reject) => {
       // Add the context to the message
       const messageWithContext = {
@@ -174,8 +193,12 @@ export class ChromiumAdapter implements PlatformAdapter {
       chrome.runtime.sendMessage(messageWithContext, (response) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
-        } else if (response && response.error) {
-          reject(new Error(response.error));
+        } else if (
+          response &&
+          typeof response === 'object' &&
+          typeof (response as Record<string, unknown>).error === 'string'
+        ) {
+          reject(new Error((response as Record<string, string>).error));
         } else {
           resolve(response);
         }
@@ -284,7 +307,7 @@ export class ChromiumAdapter implements PlatformAdapter {
    * @param script The script to execute
    * @returns A promise that resolves with the result of the script
    */
-  async executeScript<T = any>(tabId: string, script: string): Promise<T> {
+  async executeScript<T = unknown>(tabId: string, script: string): Promise<T> {
     return new Promise((resolve, reject) => {
       chrome.scripting.executeScript({
         target: { tabId: parseInt(tabId, 10) },
@@ -320,8 +343,8 @@ export class ChromiumAdapter implements PlatformAdapter {
     return new Promise((resolve, reject) => {
       chrome.scripting.executeScript({
         target: { tabId: parseInt(tabId, 10) },
-        func: func as (...injected: any[]) => any,
-        args: args as any[],
+        func,
+        args,
       }, (results) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -367,7 +390,7 @@ export class ChromiumAdapter implements PlatformAdapter {
         const notificationId = `cs-${Date.now()}`;
         
         // Create a basic notification with required fields
-        const notificationOptions = {
+        const notificationOptions: chrome.notifications.NotificationOptions<true> = {
           type: options.type,
           title: options.title,
           message: options.message,
@@ -377,7 +400,7 @@ export class ChromiumAdapter implements PlatformAdapter {
         // Create the notification
         chrome.notifications.create(
           notificationId,
-          notificationOptions as any,
+          notificationOptions,
           (createdId) => {
             if (chrome.runtime.lastError) {
               reject(new Error(chrome.runtime.lastError.message));
@@ -435,7 +458,7 @@ export class ChromiumAdapter implements PlatformAdapter {
    * Get the manifest
    * @returns The manifest
    */
-  getManifest(): any {
+  getManifest(): chrome.runtime.Manifest {
     return chrome.runtime.getManifest();
   }
 

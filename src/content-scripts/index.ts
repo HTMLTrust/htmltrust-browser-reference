@@ -10,11 +10,8 @@
  *      trust policy locally (Layer 2), and inject the corresponding status
  *      marker beside each section. No popup interaction required.
  *
- *   2. Preserve the existing popup-driven flow. The background script can
- *      still push a richer VerificationResult via UPDATE_VERIFICATION_UI, in
- *      which case we apply the legacy whole-page highlighting/badges. This
- *      keeps the popup "Verify Content" button working and supports any
- *      flows that need server-side enrichment (e.g. author name lookups).
+ *   2. Keep the popup informed of the active page and expose per-section
+ *      verification details through extension messages.
  *
  * Verification is local: the trust server is never contacted for the
  * crypto step. Trust directories are consulted only by the resolver chain
@@ -24,13 +21,12 @@ import {
   verifySignedSection,
   evaluateTrustPolicy,
   defaultResolverChain,
+  isPrivateHost,
   type VerifyResult,
   type TrustEvaluation,
-  type TrustInput,
   type KeyResolver,
 } from '@htmltrust/browser-client';
-import { MESSAGE_TYPES, CSS_CLASSES, TRUST_STATUS, STORAGE_KEYS } from '../core/common/constants';
-import { ContentProcessor } from '../core/content';
+import { CSS_CLASSES, STORAGE_KEYS } from '../core/common/constants';
 import {
   captureNavigationSnapshot,
   documentBaseUrl,
@@ -43,14 +39,12 @@ import {
   sourceHTMLForSnapshot,
   type NavigationSnapshot,
 } from '../core/content/navigation-lifecycle';
-import { PlatformAdapter, MessageContext } from '../platforms/common';
+import { PlatformAdapter, MessageContext, ExtensionMessage } from '../platforms/common';
 import {
-  VerificationResult,
-  TrustStatus,
-  VoteType,
   Settings,
   VerificationInputState,
-  getTrustDirectoryUrls,
+  getTrustDirectorySubscriptions,
+  validateTrustDirectorySubscription,
 } from '../core/common/types';
 
 // Import platform-specific adapter
@@ -59,9 +53,6 @@ import { ChromiumAdapter } from '../platforms/chromium';
 
 // Initialize platform adapter
 const platformAdapter: PlatformAdapter = new ChromiumAdapter();
-
-// Initialize content processor (used by the legacy heuristic-content path)
-const contentProcessor = new ContentProcessor();
 
 /** Marker class on the auto-verify badge container, used to avoid duplicates. */
 const AUTO_BADGE_MARKER = 'cs-auto-verification-badges';
@@ -84,6 +75,7 @@ type PageVerification = {
   trustScore: number;
   trustIndicator: 'green' | 'yellow' | 'red';
   trustLabel: string;
+  trustInputs: Array<{ source: string; contribution: number; rationale: string }>;
   keyid: string;
   algorithm: string;
   signedAt: string;
@@ -116,15 +108,10 @@ let lifecycleInstalled = false;
 let baseObserverDisposer: (() => void) | null = null;
 const sectionReverifyGeneration = new WeakMap<Element, number>();
 
-/**
- * Pull authorId out of a `.../authors/{id}/public-key` keyid URL. Returns
- * null for keyids that aren't in this shape (e.g. did:web identifiers).
- * Used purely for badge data attributes and vote button wiring.
- */
-function authorIdFromKeyid(keyid: string): string | null {
-  if (!keyid) return null;
-  const m = keyid.match(/\/authors\/([^/]+)/);
-  return m ? m[1] : null;
+function directoryUrls(settings: Settings): string[] {
+  return getTrustDirectorySubscriptions(settings)
+    .filter((subscription) => subscription.enabled && !validateTrustDirectorySubscription(subscription))
+    .map((subscription) => subscription.url);
 }
 
 /**
@@ -134,8 +121,8 @@ function authorIdFromKeyid(keyid: string): string | null {
  *   1. Read settings from storage (resolver chain needs the directory list,
  *      policy evaluator needs personal trust list / trusted domains).
  *   2. Auto-verify every signed-section on the page.
- *   3. Notify the background script that content was detected (for the popup
- *      status display) and listen for any UPDATE_VERIFICATION_UI follow-ups.
+ *   3. Notify the background script for the popup status cache, then register
+ *      the content-script message handlers.
  *
  * Errors in any single signed-section don't abort the page; each section is
  * verified independently, and a failure to load settings falls back to an
@@ -147,14 +134,22 @@ function authorIdFromKeyid(keyid: string): string | null {
  */
 let currentSettings: Settings | null = null;
 let currentResolverChain: KeyResolver[] = [];
+// Settings changes invalidate every in-flight auto-verification. A run may
+// await source fetch, key resolution, or directory policy requests, so the
+// generation is checked again before it can mutate markers or cached results.
+let autoVerifyGeneration = 0;
+
+/** Invalidate in-flight runs when policy inputs change. */
+export function invalidateAutoVerifyGeneration(): void {
+  autoVerifyGeneration += 1;
+  pageVerifications.length = 0;
+}
 
 async function initialize() {
   try {
-    console.log('Content Signing content script initialized');
-
     // 1. Settings → resolver chain + trust policy inputs
     currentSettings = await loadSettings();
-    const directories = getTrustDirectoryUrls(currentSettings);
+    const directories = directoryUrls(currentSettings);
     currentResolverChain = defaultResolverChain({
       directories,
       fetch: createVerifierFetch(),
@@ -165,9 +160,8 @@ async function initialize() {
     //    sections that already have an auto badge container next to them.
     await autoVerifyPage(currentResolverChain, currentSettings, navigationRun);
 
-    // 3. Legacy popup path: notify background, optionally apply richer UI
-    //    on UPDATE_VERIFICATION_UI messages. This is best-effort and
-    //    independent of the auto-verify result above.
+    // 3. Keep the popup's page-status cache current. This is best-effort and
+    //    independent of the per-section result above.
     await notifyContentDetected();
 
     // Listen for messages from the background script
@@ -175,7 +169,7 @@ async function initialize() {
 
     // Live-update on settings change. When the popup or options page writes
     // a new SETTINGS value to chrome.storage, we clear our existing
-    // decorations and re-decorate using the cached verification results,
+    // decorations and rerun verification against the frozen source snapshot,
     // so the user sees the effect of toggling on-page badges without
     // having to reload the page (or the whole extension).
     if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
@@ -186,10 +180,18 @@ async function initialize() {
         if (!next) return;
         currentSettings = next;
         currentResolverChain = defaultResolverChain({
-          directories: getTrustDirectoryUrls(next),
+          directories: directoryUrls(next),
           fetch: createVerifierFetch(),
         });
-        redecoratePage();
+        invalidateAutoVerifyGeneration();
+        // Settings may change the trust policy or its directory set. Clear
+        // old markers and rerun against the frozen navigation source so a
+        // stale page snapshot never displays a result for the previous policy.
+        document.querySelectorAll(SIGNED_SECTION_SELECTOR).forEach((section) => {
+          clearSectionStatusUI(section);
+        });
+        void autoVerifyPage(currentResolverChain, next, navigationRun, autoVerifyGeneration)
+          .then(notifyContentDetected);
       });
     }
   } catch (error) {
@@ -197,59 +199,10 @@ async function initialize() {
   }
 }
 
-/**
- * Strip the decorations we previously applied and re-apply using the
- * currentSettings + cached pageVerifications. Called when the user toggles
- * a setting that affects on-page badges.
- */
-function redecoratePage(): void {
-  if (!currentSettings) return;
-  const sections = document.querySelectorAll(SIGNED_SECTION_SELECTOR);
-  // Clear our existing additions on every section we've touched.
-  sections.forEach((section) => {
-    clearSectionStatusUI(section);
-  });
-  // Re-apply using cached results so we don't rerun verification.
-  const list = Array.from(sections);
-  for (const section of list) {
-    const cached = pageVerificationBySection.get(section);
-    if (!cached) continue;
-    // Reconstruct a minimal VerifyResult/TrustEvaluation shape for the UI
-    // applier. The cache is intentionally a flat snapshot; the original
-    // objects don't survive across the listener boundary.
-    const verifyShape: VerifyResult = {
-      valid: cached.cryptoValid,
-      keyid: cached.keyid,
-      algorithm: cached.algorithm,
-      contentHash: '',
-      claimsHash: '',
-      claims: cached.claims,
-      signedAt: cached.signedAt,
-      domain: cached.domain,
-      origin: cached.domain,
-      inputState: cached.inputState as VerifyResult['inputState'],
-      reason: cached.reason as VerifyResult['reason'],
-    };
-    const trustShape: TrustEvaluation = {
-      score: cached.trustScore,
-      indicator: cached.trustIndicator,
-      inputs: [],
-    };
-    const runShape: SectionVerificationRun = {
-      verify: verifyShape,
-      inputState: cached.inputState,
-      sourceVerified: cached.sourceVerified,
-      renderedVerified: cached.renderedVerified,
-      displayValid: cached.valid,
-      reason: cached.reason,
-    };
-    applySectionStatusUI(section, runShape, trustShape, cached.reason, currentSettings);
-  }
-}
-
 /** Reset cached state before a same-document navigation or page rerender. */
 export function resetNavigationState(): void {
   navigationRun += 1;
+  invalidateAutoVerifyGeneration();
   if (rerenderTimer !== null) {
     clearTimeout(rerenderTimer);
     rerenderTimer = null;
@@ -260,7 +213,6 @@ export function resetNavigationState(): void {
     clearSectionStatusUI(section);
   });
   observedSections = new Set<Element>();
-  pageVerifications.length = 0;
   navigationSnapshot = null;
 }
 
@@ -270,8 +222,9 @@ function scheduleNavigationRefresh(): void {
   lastObservedUrl = window.location.href;
   rerenderTimer = setTimeout(() => {
     rerenderTimer = null;
-    if (!currentSettings || !currentSettings.autoVerify) return;
-    void autoVerifyPage(currentResolverChain, currentSettings, navigationRun);
+    if (!currentSettings) return;
+    void autoVerifyPage(currentResolverChain, currentSettings, navigationRun)
+      .then(notifyContentDetected);
   }, 0);
 }
 
@@ -346,6 +299,7 @@ async function loadSettings(): Promise<Settings> {
     highlightVerified: true,
     highlightUnverified: false,
     trustDirectoryUrls: [],
+    trustDirectorySubscriptions: [],
     personalTrustList: [],
     trustedDomains: [],
     authMethod: 'apikey',
@@ -384,18 +338,26 @@ function redactForLog(value: unknown): unknown {
 
 function debugLog(settings: Settings, message: string, details?: unknown): void {
   if (!settings.developerDebugLogging) return;
+  // This is explicitly opt-in diagnostic output. Keep it at the browser's
+  // debug level so routine verification does not create warning noise.
   if (details === undefined) {
+    // eslint-disable-next-line no-console
     console.debug(`[htmltrust] ${message}`);
   } else {
+    // eslint-disable-next-line no-console
     console.debug(`[htmltrust] ${message}`, redactForLog(details));
   }
 }
 
 function createVerifierFetch(): typeof fetch {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
+    const inputUrl = typeof input === 'string' || input instanceof URL ? input.toString() : input.url;
+    const url = new URL(inputUrl);
     if (url.protocol !== 'https:') {
       throw new Error('network-policy-blocked: verifier key and directory fetches require HTTPS');
+    }
+    if (url.username || url.password || isPrivateHost(url.hostname)) {
+      throw new Error('network-policy-blocked: verifier fetches may not target private or credential-bearing URLs');
     }
     return fetch(input, {
       ...init,
@@ -539,11 +501,16 @@ export async function autoVerifyPage(
   resolverChain: KeyResolver[],
   settings: Settings,
   expectedNavigationRun = navigationRun,
+  expectedAutoVerifyGeneration = autoVerifyGeneration,
 ): Promise<void> {
   // `autoVerify` gates the entire content-script verification path. When off,
   // the page is left untouched and the popup's "Verifying…" state stays put
   // until the user explicitly triggers verification.
-  if (!settings.autoVerify || expectedNavigationRun !== navigationRun) {
+  if (
+    !settings.autoVerify ||
+    expectedNavigationRun !== navigationRun ||
+    expectedAutoVerifyGeneration !== autoVerifyGeneration
+  ) {
     return;
   }
 
@@ -580,7 +547,10 @@ export async function autoVerifyPage(
   // cache catches per RFC 7234 when the origin sets reasonable cache headers.
   const { snapshot: fetchedSnapshot, error: pristineFetchError } =
     await fetchPristineSignedSections(settings);
-  if (expectedNavigationRun !== navigationRun) return;
+  if (
+    expectedNavigationRun !== navigationRun ||
+    expectedAutoVerifyGeneration !== autoVerifyGeneration
+  ) return;
   navigationSnapshot = fetchedSnapshot;
   const liveSections = Array.from(sections);
   observedSections = new Set(liveSections);
@@ -602,7 +572,10 @@ export async function autoVerifyPage(
 
   let i = 0;
   for (const section of liveSections) {
-    if (expectedNavigationRun !== navigationRun) return;
+    if (
+      expectedNavigationRun !== navigationRun ||
+      expectedAutoVerifyGeneration !== autoVerifyGeneration
+    ) return;
     // Idempotency: skip sections we've already decorated.
     const knownMarker = sectionMarkers.get(section);
     if (knownMarker && !knownMarker.isConnected) sectionMarkers.delete(section);
@@ -623,19 +596,17 @@ export async function autoVerifyPage(
       );
       const verify = run.verify;
 
-      // Layer 2: trust policy. directorySubscriptions is intentionally empty
-      // here — the spec-compliant `<dir>/keys/<keyid>/reputation` endpoint
-      // shape is not yet implemented by the reference trust server. The e2e
-      // harness layers reports/score on top via a custom server lookup; the
-      // extension follows the same TODO pattern and stays out of that
-      // business until the server endpoint exists.
-      // TODO(directory-shape): wire `directorySubscriptions` once the trust
-      // server exposes `/keys/{keyid}/reputation` per spec.
       const trust = await evaluateTrustPolicy(verify, {
         personalTrustList,
         trustedDomains,
-        directorySubscriptions: [],
+        directorySubscriptions: getTrustDirectorySubscriptions(settings),
+        fetch: createVerifierFetch(),
       });
+
+      if (
+        expectedNavigationRun !== navigationRun ||
+        expectedAutoVerifyGeneration !== autoVerifyGeneration
+      ) return;
 
       applySectionStatusUI(section, run, trust, null, settings);
       const pageVerification: PageVerification = {
@@ -647,8 +618,9 @@ export async function autoVerifyPage(
         renderedVerified: run.renderedVerified,
         reason: run.reason,
         trustScore: trust.score,
-        trustIndicator: trust.indicator,
-        trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+          trustIndicator: trust.indicator,
+          trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+        trustInputs: trust.inputs,
         keyid: verify.keyid,
         algorithm: verify.algorithm,
         signedAt: verify.signedAt,
@@ -666,6 +638,10 @@ export async function autoVerifyPage(
         settings,
       );
     } catch (err) {
+      if (
+        expectedNavigationRun !== navigationRun ||
+        expectedAutoVerifyGeneration !== autoVerifyGeneration
+      ) return;
       const reason = (err as Error).message ?? 'verification error';
       console.error('Content Signing: verification failed for a signed-section');
       debugLog(settings, 'signed-section verification exception', { reason });
@@ -681,6 +657,7 @@ export async function autoVerifyPage(
         trustScore: 0,
         trustIndicator: 'red',
         trustLabel: 'Untrusted',
+        trustInputs: [],
         keyid: '',
         algorithm: '',
         signedAt: '',
@@ -798,6 +775,7 @@ export function armSectionMutationInvalidation(
 ): void {
   sectionObserverDisposers.get(section)?.();
   const observerNavigationRun = navigationRun;
+  const observerAutoVerifyGeneration = autoVerifyGeneration;
   const dispose = observeSignedSection(section, (changedSection) => {
     const generation = (sectionReverifyGeneration.get(changedSection) ?? 0) + 1;
     sectionReverifyGeneration.set(changedSection, generation);
@@ -824,11 +802,13 @@ export function armSectionMutationInvalidation(
         const trust = await evaluateTrustPolicy(run.verify, {
           personalTrustList: activeSettings.personalTrustList ?? [],
           trustedDomains: activeSettings.trustedDomains ?? [],
-          directorySubscriptions: [],
+          directorySubscriptions: getTrustDirectorySubscriptions(activeSettings),
+          fetch: createVerifierFetch(),
         });
         if (
           sectionReverifyGeneration.get(changedSection) !== generation ||
-          navigationRun !== observerNavigationRun
+          navigationRun !== observerNavigationRun ||
+          autoVerifyGeneration !== observerAutoVerifyGeneration
         ) return;
         applySectionStatusUI(changedSection, run, trust, null, activeSettings);
         const existing = pageVerificationBySection.get(changedSection);
@@ -843,7 +823,8 @@ export function armSectionMutationInvalidation(
           reason: run.reason,
           trustScore: trust.score,
           trustIndicator: trust.indicator,
-          trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+        trustLabel: trust.indicator === 'green' ? 'Trusted' : trust.indicator === 'red' ? 'Untrusted' : 'Unknown',
+          trustInputs: trust.inputs,
           keyid: run.verify.keyid,
           algorithm: run.verify.algorithm,
           signedAt: run.verify.signedAt,
@@ -856,7 +837,8 @@ export function armSectionMutationInvalidation(
       } catch (error) {
         if (
           sectionReverifyGeneration.get(changedSection) !== generation ||
-          navigationRun !== observerNavigationRun
+          navigationRun !== observerNavigationRun ||
+          autoVerifyGeneration !== observerAutoVerifyGeneration
         ) return;
         const reason = error instanceof Error ? error.message : String(error);
         applySectionStatusUI(
@@ -879,112 +861,17 @@ export function armSectionMutationInvalidation(
             trustScore: 0,
             trustIndicator: 'red',
             trustLabel: 'Untrusted',
+            trustInputs: [],
           };
           pageVerificationBySection.set(changedSection, failed);
           const index = pageVerifications.indexOf(existing);
           if (index >= 0) pageVerifications[index] = failed;
         }
       }
+      await notifyContentDetected();
     })();
   });
   sectionObserverDisposers.set(section, dispose);
-}
-
-/**
- * Build the inline badge container for a successful or failed verification.
- *
- * Matches the e2e harness's visual style (playwright-session.ts lines
- * 312-360) so consumer-facing screenshots and the live extension look the
- * same. CSS classes also match the existing content.css file so the
- * stylesheet shipped with the extension styles them correctly.
- */
-export function buildAutoBadges(verify: VerifyResult, trust: TrustEvaluation): HTMLElement {
-  const authorId = verify.keyid ? authorIdFromKeyid(verify.keyid) : null;
-
-  const badges = document.createElement('div');
-  badges.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
-  badges.setAttribute('data-author-id', authorId ?? '');
-  badges.setAttribute('data-trust-score', String(trust.score));
-  badges.setAttribute('data-keyid', verify.keyid ?? '');
-  badges.style.cssText =
-    'display: flex; gap: 8px; padding: 8px; margin: 8px 0; font-family: sans-serif; font-size: 14px; align-items: center; flex-wrap: wrap;';
-
-  // Signature validity badge
-  const sigBadge = document.createElement('span');
-  const renderedValid = verify.valid && verify.inputState === 'rendered-match';
-  if (renderedValid) {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_VERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-    sigBadge.textContent = 'Rendered content verified';
-    sigBadge.style.cssText =
-      'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
-  } else if (verify.valid) {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_WARNING} ${CSS_CLASSES.VALIDITY_BADGE}`;
-    sigBadge.textContent = verify.inputState === 'stale'
-      ? '⚠ Rendered content INVALID (source differs)'
-      : '⚠ Source signature valid; rendered content not verified';
-    sigBadge.style.cssText =
-      'background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px;';
-  } else {
-    sigBadge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED} ${CSS_CLASSES.VALIDITY_BADGE}`;
-    sigBadge.textContent = `✗ Signature INVALID${verify.reason ? ` (${verify.reason})` : ''}`;
-    sigBadge.style.cssText =
-      'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
-  }
-  badges.appendChild(sigBadge);
-
-  // Trust badge — color reflects the policy evaluator's indicator.
-  const trustBadge = document.createElement('span');
-  const trustClass =
-    trust.indicator === 'green'
-      ? CSS_CLASSES.TRUST_BADGE_TRUSTED
-      : trust.indicator === 'red'
-      ? CSS_CLASSES.TRUST_BADGE_UNTRUSTED
-      : CSS_CLASSES.TRUST_BADGE_UNKNOWN;
-  trustBadge.className = `${CSS_CLASSES.TRUST_BADGE} ${trustClass}`;
-  trustBadge.textContent = `Trust: ${trust.score}%`;
-  if (trust.indicator === 'green') {
-    trustBadge.style.cssText =
-      'background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px;';
-  } else if (trust.indicator === 'red') {
-    trustBadge.style.cssText =
-      'background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px;';
-  } else {
-    trustBadge.style.cssText =
-      'background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 4px;';
-  }
-  sigBadge.title = 'Page marker only; open the extension popup for authoritative verification details.';
-
-  // Hover tooltip: per-input rationale, useful for debugging / auditability.
-  trustBadge.title = trust.inputs
-    .map((r: TrustInput) => `${r.source}: ${r.contribution} (${r.rationale})`)
-    .join('\n');
-  badges.appendChild(trustBadge);
-
-  // Vote buttons (wired only when we extracted an authorId; did:web keyids
-  // are skipped because the existing vote API is keyed by authorId, not keyid).
-  if (authorId) {
-    badges.appendChild(buildVoteButton(CSS_CLASSES.UPVOTE_BUTTON, '👍 Trust', authorId, VoteType.UPVOTE));
-    badges.appendChild(buildVoteButton(CSS_CLASSES.DOWNVOTE_BUTTON, '👎 Distrust', authorId, VoteType.DOWNVOTE));
-  }
-
-  return badges;
-}
-
-function buildVoteButton(
-  cssClass: string,
-  label: string,
-  authorId: string,
-  vote: VoteType,
-): HTMLButtonElement {
-  const btn = document.createElement('button');
-  btn.className = `${CSS_CLASSES.VOTE_BUTTON} ${cssClass}`;
-  btn.textContent = label;
-  btn.dataset.authorId = authorId;
-  btn.dataset.voteType = vote;
-  btn.style.cssText =
-    'cursor: pointer; padding: 4px 8px; border: 1px solid #ccc; background: white; border-radius: 4px;';
-  btn.addEventListener('click', handleVoteButtonClick);
-  return btn;
 }
 
 /**
@@ -994,308 +881,23 @@ function buildVoteButton(
  */
 async function notifyContentDetected(): Promise<void> {
   try {
-    // Use legacy heuristic-based content extraction for the popup; the
-    // auto-verify path uses the actual signed-section element directly.
-    const extractedContent = contentProcessor.extractContent(document);
-
-    // Best-effort notification. We deliberately ignore the response: the
-    // auto-verify path above already applied the authoritative UI based on
-    // the local verifier's result, and the legacy enrichment path would
-    // happily overwrite that with default "Untrusted / unknown domain"
-    // markers driven by a stale VerificationResult shape.
+    // The auto-verify path already owns the per-section UI, so the response
+    // does not need to cross back into this page.
     await platformAdapter.sendMessage(MessageContext.CONTENT, {
-      type: MESSAGE_TYPES.CONTENT_DETECTED,
+      type: 'CONTENT_DETECTED',
       url: window.location.href,
-      content: extractedContent,
+      verified: pageVerifications.length > 0 &&
+        pageVerifications.every((result) => result.valid),
     });
-  } catch (err) {
-    // Background may legitimately have no enrichment to offer. Don't pollute
-    // the console for this case.
-    console.debug('Content Signing: notifyContentDetected returned no enrichment', err);
+  } catch {
+    // Background may legitimately have no enrichment to offer.
   }
-}
-
-/**
- * Apply legacy verification UI driven by the background script. Kept for
- * back-compat with the popup → background → content-script enrichment
- * flow. The auto-verify path above is what the user sees by default; this
- * only runs if the background pushes a result.
- */
-function applyVerificationUI(verificationResult: VerificationResult) {
-  try {
-    // Get settings from the verification result
-    const settings = verificationResult.settings || {
-      showBadges: true,
-      highlightVerified: true,
-      highlightUnverified: false,
-    };
-
-    // Find content elements to highlight
-    const contentElements = findContentElements();
-
-    // Apply verification UI to each content element
-    contentElements.forEach(element => {
-      applyVerificationUIToElement(element, verificationResult, settings);
-    });
-  } catch (error) {
-    console.error('Failed to apply verification UI:', error);
-  }
-}
-
-/**
- * Find HTMLTrust signed-section elements on the page
- * @returns An array of signed-section elements (empty if none found)
- */
-function findContentElements(): Element[] {
-  return Array.from(document.querySelectorAll('signed-section'));
-}
-
-/**
- * Apply verification UI to a specific element
- */
-function applyVerificationUIToElement(
-  element: Element,
-  verificationResult: VerificationResult,
-  settings: NonNullable<VerificationResult['settings']>
-) {
-  // Add verification badges if enabled
-  if (settings.showBadges) {
-    addVerificationBadges(element, verificationResult);
-  }
-}
-
-/**
- * Add verification badges to an element
- */
-function addVerificationBadges(element: Element, verificationResult: VerificationResult) {
-  try {
-    clearSectionStatusUI(element);
-    // Create badge container
-    const badgeContainer = document.createElement('div');
-    badgeContainer.className = `${CSS_CLASSES.VERIFICATION_BADGES} ${AUTO_BADGE_MARKER}`;
-
-    // Add validity badge
-    const validityBadge = createValidityBadge(verificationResult);
-    badgeContainer.appendChild(validityBadge);
-
-    // Add trust badge
-    const trustBadge = createTrustBadge(verificationResult);
-    badgeContainer.appendChild(trustBadge);
-
-    // Keep extension UI outside the signed element. This prevents a badge or
-    // tooltip from becoming part of the bytes that the signature protects.
-    const anchor = outermostSignedSection(element);
-    anchor.parentNode?.insertBefore(badgeContainer, anchor.nextSibling);
-    sectionMarkers.set(element, badgeContainer);
-  } catch (error) {
-    console.error('Failed to add verification badges:', error);
-  }
-}
-
-function createValidityBadge(verificationResult: VerificationResult): HTMLElement {
-  const badge = document.createElement('span');
-  badge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.VALIDITY_BADGE}`;
-
-  if (verificationResult.verified) {
-    badge.classList.add(CSS_CLASSES.VERIFICATION_BADGE_VERIFIED);
-    badge.textContent = '✓';
-
-    const tooltip = document.createElement('span');
-    tooltip.className = CSS_CLASSES.TOOLTIP;
-    tooltip.textContent = `Verified by ${verificationResult.user?.name || 'unknown'}`;
-
-    if (verificationResult.user?.id) {
-      const voteButtons = createVoteButtons(verificationResult.user.id);
-      tooltip.appendChild(voteButtons);
-    }
-
-    badge.appendChild(tooltip);
-  } else {
-    badge.classList.add(CSS_CLASSES.VERIFICATION_BADGE_UNVERIFIED);
-    badge.textContent = '✗';
-
-    const tooltip = document.createElement('span');
-    tooltip.className = CSS_CLASSES.TOOLTIP;
-    tooltip.textContent = verificationResult.reason || 'Not verified';
-    badge.appendChild(tooltip);
-  }
-
-  return badge;
-}
-
-function createTrustBadge(verificationResult: VerificationResult): HTMLElement {
-  const badge = document.createElement('span');
-  badge.className = `${CSS_CLASSES.VERIFICATION_BADGE} ${CSS_CLASSES.TRUST_BADGE}`;
-
-  const trustStatus = determineTrustStatus(verificationResult);
-
-  switch (trustStatus) {
-    case TRUST_STATUS.TRUSTED: {
-      badge.classList.add(CSS_CLASSES.TRUST_BADGE_TRUSTED);
-      badge.textContent = '🔒';
-      const trustedTooltip = document.createElement('span');
-      trustedTooltip.className = CSS_CLASSES.TOOLTIP;
-      trustedTooltip.textContent = `Trusted source: ${verificationResult.domain || 'unknown domain'}`;
-      badge.appendChild(trustedTooltip);
-      break;
-    }
-    case TRUST_STATUS.UNTRUSTED: {
-      badge.classList.add(CSS_CLASSES.TRUST_BADGE_UNTRUSTED);
-      badge.textContent = '⚠️';
-      const untrustedTooltip = document.createElement('span');
-      untrustedTooltip.className = CSS_CLASSES.TOOLTIP;
-      untrustedTooltip.textContent = `Untrusted source: ${verificationResult.domain || 'unknown domain'}`;
-      badge.appendChild(untrustedTooltip);
-      break;
-    }
-    case TRUST_STATUS.UNKNOWN:
-    default: {
-      badge.classList.add(CSS_CLASSES.TRUST_BADGE_UNKNOWN);
-      badge.textContent = '?';
-      const unknownTooltip = document.createElement('span');
-      unknownTooltip.className = CSS_CLASSES.TOOLTIP;
-      unknownTooltip.textContent = `Unknown source: ${verificationResult.domain || 'unknown domain'}`;
-      badge.appendChild(unknownTooltip);
-      break;
-    }
-  }
-
-  return badge;
-}
-
-function createVoteButtons(authorId: string): HTMLElement {
-  const container = document.createElement('div');
-  container.className = CSS_CLASSES.VOTE_BUTTONS;
-
-  const upvoteButton = document.createElement('button');
-  upvoteButton.className = `${CSS_CLASSES.VOTE_BUTTON} ${CSS_CLASSES.UPVOTE_BUTTON}`;
-  upvoteButton.textContent = '👍';
-  upvoteButton.title = 'Upvote this author';
-  upvoteButton.dataset.authorId = authorId;
-  upvoteButton.dataset.voteType = VoteType.UPVOTE;
-
-  const downvoteButton = document.createElement('button');
-  downvoteButton.className = `${CSS_CLASSES.VOTE_BUTTON} ${CSS_CLASSES.DOWNVOTE_BUTTON}`;
-  downvoteButton.textContent = '👎';
-  downvoteButton.title = 'Downvote this author';
-  downvoteButton.dataset.authorId = authorId;
-  downvoteButton.dataset.voteType = VoteType.DOWNVOTE;
-
-  upvoteButton.addEventListener('click', handleVoteButtonClick);
-  downvoteButton.addEventListener('click', handleVoteButtonClick);
-
-  container.appendChild(upvoteButton);
-  container.appendChild(downvoteButton);
-
-  checkExistingVote(authorId, upvoteButton, downvoteButton);
-
-  return container;
-}
-
-async function checkExistingVote(
-  authorId: string,
-  upvoteButton: HTMLButtonElement,
-  downvoteButton: HTMLButtonElement
-): Promise<void> {
-  try {
-    const response = await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
-      type: 'GET_AUTHOR_VOTE',
-      authorId,
-    });
-
-    if (response && response.vote) {
-      if (response.vote === VoteType.UPVOTE) {
-        upvoteButton.classList.add(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-        downvoteButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-      } else if (response.vote === VoteType.DOWNVOTE) {
-        downvoteButton.classList.add(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-        upvoteButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-      } else {
-        upvoteButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-        downvoteButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-      }
-    }
-  } catch (error) {
-    console.error('Failed to check existing vote:', error);
-  }
-}
-
-async function handleVoteButtonClick(event: MouseEvent): Promise<void> {
-  event.preventDefault();
-  event.stopPropagation();
-
-  const button = event.currentTarget as HTMLButtonElement;
-  const authorId = button.dataset.authorId;
-  const voteType = button.dataset.voteType as VoteType;
-
-  if (!authorId || !voteType) {
-    console.error('Missing authorId or voteType in vote button');
-    return;
-  }
-
-  const isToggle = button.classList.contains(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-  const finalVoteType = isToggle ? VoteType.NEUTRAL : voteType;
-
-  const container = button.parentElement;
-  const upvoteButton = container?.querySelector(`.${CSS_CLASSES.UPVOTE_BUTTON}`) as HTMLButtonElement;
-  const downvoteButton = container?.querySelector(`.${CSS_CLASSES.DOWNVOTE_BUTTON}`) as HTMLButtonElement;
-
-  try {
-    const otherButton = voteType === VoteType.UPVOTE ? downvoteButton : upvoteButton;
-
-    if (finalVoteType === VoteType.NEUTRAL) {
-      button.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-    } else {
-      button.classList.add(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-      if (otherButton) {
-        otherButton.classList.remove(CSS_CLASSES.VOTE_BUTTON_ACTIVE);
-      }
-    }
-
-    await platformAdapter.sendMessage(MessageContext.BACKGROUND, {
-      type: MESSAGE_TYPES.SUBMIT_VOTE,
-      authorId,
-      vote: finalVoteType,
-      url: window.location.href,
-      contentHash: null,
-    });
-
-    console.log(`Vote ${finalVoteType} submitted for author ${authorId}`);
-  } catch (error) {
-    console.error('Failed to submit vote:', error);
-    if (upvoteButton && downvoteButton) {
-      checkExistingVote(authorId, upvoteButton, downvoteButton);
-    }
-  }
-}
-
-function determineTrustStatus(verificationResult: VerificationResult): TrustStatus {
-  if (verificationResult.trustStatus) {
-    return verificationResult.trustStatus;
-  }
-
-  if (!verificationResult.verified) {
-    return TRUST_STATUS.UNTRUSTED;
-  }
-
-  if (verificationResult.trustDirectoryEntry) {
-    return TRUST_STATUS.TRUSTED;
-  }
-
-  if (verificationResult.user) {
-    return verificationResult.user.verified ? TRUST_STATUS.TRUSTED : TRUST_STATUS.UNTRUSTED;
-  }
-
-  return TRUST_STATUS.UNKNOWN;
 }
 
 function listenForMessages() {
   platformAdapter.registerMessageListeners({
-    [MessageContext.BACKGROUND]: async (message: any) => {
+    [MessageContext.BACKGROUND]: async (message: ExtensionMessage) => {
       switch (message.type) {
-        case 'UPDATE_VERIFICATION_UI':
-          applyVerificationUI(message.verificationResult);
-          return { success: true };
         case 'GET_PAGE_VERIFICATIONS':
         {
           // Popup reads the per-section results from here. Snapshot to keep
@@ -1311,26 +913,6 @@ function listenForMessages() {
             results: Object.freeze(results),
           };
         }
-        case MESSAGE_TYPES.VOTE_ACKNOWLEDGED:
-          if (message.authorId) {
-            const upvoteButtons = document.querySelectorAll(
-              `.${CSS_CLASSES.UPVOTE_BUTTON}[data-author-id="${message.authorId}"]`
-            );
-            const downvoteButtons = document.querySelectorAll(
-              `.${CSS_CLASSES.DOWNVOTE_BUTTON}[data-author-id="${message.authorId}"]`
-            );
-
-            upvoteButtons.forEach((upvoteButton) => {
-              downvoteButtons.forEach((downvoteButton) => {
-                checkExistingVote(
-                  message.authorId,
-                  upvoteButton as HTMLButtonElement,
-                  downvoteButton as HTMLButtonElement
-                );
-              });
-            });
-          }
-          return { success: true };
         default:
           throw new Error(`Unknown message type: ${message.type}`);
       }

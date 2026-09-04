@@ -37,7 +37,7 @@ export interface PlatformAdapter {
    * @param message The message to send
    * @returns A promise that resolves with the response
    */
-  sendMessage<T = any>(context: MessageContext, message: any): Promise<T>;
+  sendMessage<T = unknown>(context: MessageContext, message: ExtensionMessage): Promise<T>;
 
   /**
    * Get the current tab
@@ -84,7 +84,7 @@ export interface PlatformAdapter {
    * @param script The script to execute
    * @returns A promise that resolves with the result of the script
    */
-  executeScript<T = any>(tabId: string, script: string): Promise<T>;
+  executeScript<T = unknown>(tabId: string, script: string): Promise<T>;
 
   /**
    * Execute a function in a tab, passing runtime data as arguments.
@@ -144,7 +144,12 @@ export interface PlatformAdapter {
    * Get the manifest
    * @returns The manifest
    */
-  getManifest(): any;
+  getManifest(): ExtensionManifest;
+}
+
+/** Browser-neutral manifest fields consumed by shared extension UI. */
+export interface ExtensionManifest {
+  version: string;
 }
 
 /**
@@ -161,18 +166,30 @@ export enum MessageContext {
   OPTIONS = 'options',
 }
 
+/** Runtime message with a discriminating type and context-specific fields. */
+export interface ExtensionMessage {
+  type: string;
+  [key: string]: unknown;
+}
+
+/** Validate the message envelope before dispatching untrusted runtime data. */
+export function isExtensionMessage(value: unknown): value is ExtensionMessage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return typeof (value as Record<string, unknown>).type === 'string';
+}
+
 /**
  * Message handlers
  */
 export interface MessageHandlers {
   /** Handler for messages from the background script */
-  [MessageContext.BACKGROUND]?: (message: any) => Promise<any>;
+  [MessageContext.BACKGROUND]?: (message: ExtensionMessage) => Promise<unknown>;
   /** Handler for messages from content scripts */
-  [MessageContext.CONTENT]?: (message: any) => Promise<any>;
+  [MessageContext.CONTENT]?: (message: ExtensionMessage) => Promise<unknown>;
   /** Handler for messages from the popup */
-  [MessageContext.POPUP]?: (message: any) => Promise<any>;
+  [MessageContext.POPUP]?: (message: ExtensionMessage) => Promise<unknown>;
   /** Handler for messages from the options page */
-  [MessageContext.OPTIONS]?: (message: any) => Promise<any>;
+  [MessageContext.OPTIONS]?: (message: ExtensionMessage) => Promise<unknown>;
 }
 
 /**

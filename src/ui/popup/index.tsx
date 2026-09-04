@@ -3,10 +3,11 @@
  */
 import React, { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Settings, User, Profile } from '../../core/common';
+import { Settings, User, Profile, metadataToClaims } from '../../core/common';
 import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_PROFILE } from '../../core/common/constants';
 import { PlatformAdapter, MessageContext } from '../../platforms/common';
 import { MetadataInput, ProfileSelector } from '../components';
+import { parsePageVerificationResponse, type PageVerification } from './page-verification';
 
 // Import styles
 import '../../assets/profile-selector.css';
@@ -17,29 +18,6 @@ import { ChromiumAdapter } from '../../platforms/chromium';
 
 // Initialize platform adapter
 const platformAdapter: PlatformAdapter = new ChromiumAdapter();
-
-/**
- * Per-section verification snapshot served by the content script.
- * Mirrors PageVerification in src/content-scripts/index.ts.
- */
-interface PageVerification {
-  index: number;
-  /** True only when the currently rendered DOM is verified. */
-  valid: boolean;
-  cryptoValid: boolean;
-  inputState: 'source-only' | 'stale' | 'rendered-match';
-  sourceVerified: boolean;
-  renderedVerified: boolean;
-  reason: string | null;
-  trustScore: number;
-  trustIndicator: 'green' | 'yellow' | 'red';
-  trustLabel: string;
-  keyid: string;
-  algorithm: string;
-  signedAt: string;
-  domain: string;
-  claims: Record<string, string>;
-}
 
 /**
  * Popup component props
@@ -59,8 +37,6 @@ interface PopupState {
   isLoading: boolean;
   error: string | null;
   currentUrl: string;
-  isVerified: boolean;
-  verificationStatus: string;
   showMetadataInput: boolean;
   metadata: {
     dublinCore: Record<string, string>;
@@ -81,7 +57,7 @@ async function loadPageVerifications(): Promise<PageVerification[]> {
     const tab = tabs[0];
     if (!tab?.id) return [];
     const reply = await chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_VERIFICATIONS' });
-    return Array.isArray(reply?.results) ? (reply.results as PageVerification[]) : [];
+    return parsePageVerificationResponse(reply);
   } catch {
     return [];
   }
@@ -99,8 +75,6 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
     isLoading: true,
     error: null,
     currentUrl: '',
-    isVerified: false,
-    verificationStatus: 'Not verified',
     showMetadataInput: false,
     metadata: {
       dublinCore: {},
@@ -139,12 +113,6 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
         const activeProfileId = await storage.get<string>(STORAGE_KEYS.ACTIVE_PROFILE) ||
           profiles.find(p => p.isDefault)?.id || profiles[0].id;
         
-        // Get the verification status for the current URL
-        const verificationResult = await adapter.sendMessage(MessageContext.POPUP, {
-          type: 'GET_VERIFICATION_STATUS',
-          url: currentTab.url,
-        });
-        
         // Get the initial metadata from the active profile
         const activeProfile = profiles.find(p => p.id === activeProfileId);
         const initialMetadata = {
@@ -161,8 +129,6 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           isLoading: false,
           error: null,
           currentUrl: currentTab.url,
-          isVerified: verificationResult?.verified || false,
-          verificationStatus: verificationResult?.status || 'Not verified',
           showMetadataInput: false,
           metadata: initialMetadata,
           pageVerifications: [],
@@ -252,18 +218,13 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
   const handleVerifyContent = async () => {
     try {
       setState(prevState => ({ ...prevState, isLoading: true }));
-      
-      // Send a message to the background script to verify the content
-      const verificationResult = await adapter.sendMessage(MessageContext.POPUP, {
-        type: 'VERIFY_CONTENT',
-        url: state.currentUrl,
-      });
-      
+
+      const results = await loadPageVerifications();
       setState(prevState => ({
         ...prevState,
         isLoading: false,
-        isVerified: verificationResult?.verified || false,
-        verificationStatus: verificationResult?.status || 'Not verified',
+        pageVerifications: results,
+        pageVerificationsLoaded: true,
       }));
     } catch (error) {
       setState(prevState => ({
@@ -293,11 +254,10 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
         state.profiles[0];
       
       // Send a message to the background script to sign the content
-      const signResult = await adapter.sendMessage(MessageContext.POPUP, {
+      await adapter.sendMessage(MessageContext.POPUP, {
         type: 'SIGN_CONTENT',
         url: state.currentUrl,
-        metadata: state.metadata,
-        trustDirectoryUrl: activeProfile.trustDirectoryUrl
+        claims: metadataToClaims(state.metadata),
       });
       
       // Save the metadata to the profile
@@ -324,8 +284,6 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
         ...prevState,
         profiles: updatedProfiles,
         isLoading: false,
-        isVerified: true,
-        verificationStatus: 'Signed by you',
         showMetadataInput: false
       }));
     } catch (error) {
@@ -482,6 +440,18 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
                       <strong>Input:</strong> {v.inputState}
                       {v.reason && v.cryptoValid ? ` (${v.reason})` : ''}
                     </div>
+                    {(v.trustInputs ?? []).length > 0 ? (
+                      <details style={{ marginTop: 4 }}>
+                        <summary>Why this trust result?</summary>
+                        <ul style={{ margin: '2px 0 0 16px', padding: 0 }}>
+                          {(v.trustInputs ?? []).map((input) => (
+                            <li key={`${input.source}-${input.rationale}`}>
+                              {input.rationale}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null}
                     {v.keyid ? (
                       <div style={{ wordBreak: 'break-all' }}>
                         <strong>Signer:</strong> {v.keyid}
@@ -516,13 +486,6 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
           )}
         </div>
 
-        <div className="verification-status" style={{ display: 'none' }}>
-          <h2>Verification Status</h2>
-          <p className={state.isVerified ? 'verified' : 'not-verified'}>
-            {state.verificationStatus}
-          </p>
-        </div>
-        
         {state.showMetadataInput ? (
           <div className="metadata-section">
             <h2>Add Metadata</h2>
@@ -552,7 +515,7 @@ const Popup: React.FC<PopupProps> = ({ adapter }) => {
         ) : (
           <div className="actions">
             <button onClick={handleVerifyContent} disabled={!state.settings.autoVerify}>
-              Verify Content
+              Refresh verification
             </button>
             
             {state.user && (
